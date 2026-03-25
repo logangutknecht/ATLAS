@@ -3,3 +3,5 @@ vispy>=0.14
 laspy[lazrs]>=2.5
 numpy>=1.24
 scipy>=1.10
+pyproj>=3.4
+Pillow>=9.0
