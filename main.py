@@ -438,6 +438,7 @@ class ControlPanel(QWidget):
     voxel_requested = pyqtSignal(float)
     elev_requested = pyqtSignal(float, float)
     ground_requested = pyqtSignal(float, float)
+    hide_nonground_toggled = pyqtSignal(bool)
     reset_processing = pyqtSignal()
     satellite_requested = pyqtSignal()
 
@@ -619,6 +620,12 @@ class ControlPanel(QWidget):
         self.ground_info.setWordWrap(True)
         lay.addWidget(self.ground_info)
 
+        from PyQt6.QtWidgets import QCheckBox
+        self.hide_nonground_cb = QCheckBox("Hide Non-Ground Points")
+        self.hide_nonground_cb.setEnabled(False)
+        self.hide_nonground_cb.toggled.connect(self.hide_nonground_toggled.emit)
+        lay.addWidget(self.hide_nonground_cb)
+
         # Reset
         self.reset_btn = QPushButton("Reset to Original")
         self.reset_btn.setStyleSheet("background-color:#c42b1c; color:white;")
@@ -729,6 +736,7 @@ class LiDARViewer(QMainWindow):
         self._cloud = None
         self._mask = None
         self._ground_mask = None
+        self._hide_nonground = False
         self._sat_colors = None          # (N,4) satellite RGBA for full cloud
         self._dark_bg = True
         self._filepath = None
@@ -797,6 +805,7 @@ class LiDARViewer(QMainWindow):
         c.voxel_requested.connect(lambda v: self._run_proc("voxel", voxel_size=v))
         c.elev_requested.connect(lambda lo, hi: self._run_proc("elevation", z_min=lo, z_max=hi))
         c.ground_requested.connect(self._run_ground_seg)
+        c.hide_nonground_toggled.connect(self._toggle_nonground)
         c.reset_processing.connect(self._reset_proc)
         c.satellite_requested.connect(self._run_satellite)
 
@@ -874,6 +883,14 @@ class LiDARViewer(QMainWindow):
         else:
             colors = compute_colors(pts, attrs, mode)
 
+        # Hide non-ground points when the toggle is active
+        if self._hide_nonground and self._ground_mask is not None:
+            gm = self._ground_mask
+            if self._mask is not None:
+                gm = gm[self._mask]
+            pts = pts[gm]
+            colors = colors[gm]
+
         self.viewer.display(pts, colors, self.controls.size_slider.value())
 
     def _toggle_bg(self):
@@ -920,6 +937,10 @@ class LiDARViewer(QMainWindow):
 
     # -- ground seg ---------------------------------------------------------
 
+    def _toggle_nonground(self, hide):
+        self._hide_nonground = hide
+        self._render()
+
     def _run_ground_seg(self, cell_size, height_threshold):
         if not self._cloud:
             return
@@ -949,6 +970,7 @@ class LiDARViewer(QMainWindow):
         )
         self.status.setText("Ground seg done - {:,} ground, {:,} non-ground".format(n_g, n_t - n_g))
 
+        self.controls.hide_nonground_cb.setEnabled(True)
         self._add_color_mode("Ground")
         self.controls.color_combo.setCurrentText("Ground")
         self._render()
@@ -1018,7 +1040,12 @@ class LiDARViewer(QMainWindow):
     def _reset_proc(self):
         self._mask = None
         self._ground_mask = None
+        self._hide_nonground = False
         self._sat_colors = None
+        self.controls.hide_nonground_cb.blockSignals(True)
+        self.controls.hide_nonground_cb.setChecked(False)
+        self.controls.hide_nonground_cb.setEnabled(False)
+        self.controls.hide_nonground_cb.blockSignals(False)
         self.controls.ground_info.setText("")
         self.controls.sat_info.setText("")
 
