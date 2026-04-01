@@ -22,10 +22,11 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QComboBox, QFileDialog, QGroupBox,
     QDoubleSpinBox, QProgressBar, QStatusBar, QSplitter, QScrollArea,
-    QMessageBox, QSpinBox, QLineEdit,
+    QMessageBox, QSpinBox, QLineEdit, QToolBar, QDialog,
+    QDialogButtonBox, QGridLayout,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QAction
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt6.QtGui import QAction, QPainter, QPen, QFont, QColor
 
 from vispy import scene
 from vispy.color import Colormap, get_colormap
@@ -128,6 +129,7 @@ QMenuBar::item:selected { background-color: #0078d4; }
 QMenu { background-color: #2d2d2d; border: 1px solid #555; }
 QMenu::item:selected { background-color: #0078d4; }
 QSplitter::handle { background-color: #333; width: 2px; }
+QToolBar { background-color: #252525; border-bottom: 1px solid #333; }
 """
 
 
@@ -298,7 +300,7 @@ class ProcessingThread(QThread):
 
 class SatelliteThread(QThread):
     """Fetch satellite imagery and colorize every point in the cloud."""
-    finished = pyqtSignal(object)   # dict: {colors, info}
+    finished = pyqtSignal(object)
     error = pyqtSignal(str)
     progress = pyqtSignal(str)
 
@@ -330,11 +332,7 @@ class SatelliteThread(QThread):
 # ---------------------------------------------------------------------------
 
 class _PanCamera(scene.TurntableCamera):
-    """TurntableCamera with right-click drag mapped to pan.
-
-    Default vispy mapping:  left=orbit, right=zoom, shift+left=pan
-    This camera remaps:     left=orbit, right=pan,  scroll=zoom
-    """
+    """TurntableCamera with right-click drag mapped to pan."""
 
     def viewbox_mouse_event(self, event):
         if event.handled or not self.interactive:
@@ -376,6 +374,229 @@ class _PanCamera(scene.TurntableCamera):
 
 
 # ---------------------------------------------------------------------------
+# Processing parameter dialogs
+# ---------------------------------------------------------------------------
+
+class _SORDialog(QDialog):
+    def __init__(self, parent=None, k=20, std=2.0):
+        super().__init__(parent)
+        self.setWindowTitle("Statistical Outlier Removal")
+        lay = QVBoxLayout(self)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("K neighbours:"))
+        self.k_spin = QSpinBox()
+        self.k_spin.setRange(5, 200)
+        self.k_spin.setValue(k)
+        row.addWidget(self.k_spin)
+        row.addWidget(QLabel("Std ratio:"))
+        self.std_spin = QDoubleSpinBox()
+        self.std_spin.setRange(0.1, 10.0)
+        self.std_spin.setValue(std)
+        self.std_spin.setSingleStep(0.1)
+        row.addWidget(self.std_spin)
+        lay.addLayout(row)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+
+class _VoxelDialog(QDialog):
+    def __init__(self, parent=None, size=0.10):
+        super().__init__(parent)
+        self.setWindowTitle("Voxel Downsample")
+        lay = QVBoxLayout(self)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Voxel size:"))
+        self.size_spin = QDoubleSpinBox()
+        self.size_spin.setRange(0.001, 50.0)
+        self.size_spin.setValue(size)
+        self.size_spin.setSingleStep(0.01)
+        self.size_spin.setDecimals(3)
+        row.addWidget(self.size_spin)
+        lay.addLayout(row)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+
+class _ElevClipDialog(QDialog):
+    def __init__(self, parent=None, z_min=0.0, z_max=1000.0):
+        super().__init__(parent)
+        self.setWindowTitle("Elevation Clip")
+        lay = QVBoxLayout(self)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Z min:"))
+        self.z_min_spin = QDoubleSpinBox()
+        self.z_min_spin.setRange(-100000, 100000)
+        self.z_min_spin.setDecimals(2)
+        self.z_min_spin.setValue(z_min)
+        row.addWidget(self.z_min_spin)
+        row.addWidget(QLabel("Z max:"))
+        self.z_max_spin = QDoubleSpinBox()
+        self.z_max_spin.setRange(-100000, 100000)
+        self.z_max_spin.setDecimals(2)
+        self.z_max_spin.setValue(z_max)
+        row.addWidget(self.z_max_spin)
+        lay.addLayout(row)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+
+class _GroundSegDialog(QDialog):
+    def __init__(self, parent=None, cell=1.0, ht=0.3):
+        super().__init__(parent)
+        self.setWindowTitle("Ground Segmentation")
+        lay = QVBoxLayout(self)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Cell size:"))
+        self.cell_spin = QDoubleSpinBox()
+        self.cell_spin.setRange(0.1, 20.0)
+        self.cell_spin.setValue(cell)
+        self.cell_spin.setSingleStep(0.1)
+        self.cell_spin.setDecimals(1)
+        row.addWidget(self.cell_spin)
+        row.addWidget(QLabel("Height threshold:"))
+        self.ht_spin = QDoubleSpinBox()
+        self.ht_spin.setRange(0.05, 10.0)
+        self.ht_spin.setValue(ht)
+        self.ht_spin.setSingleStep(0.05)
+        self.ht_spin.setDecimals(2)
+        row.addWidget(self.ht_spin)
+        lay.addLayout(row)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+
+class _SatelliteDialog(QDialog):
+    def __init__(self, parent=None, info="", epsg=""):
+        super().__init__(parent)
+        self.setWindowTitle("Apply Satellite Texture")
+        lay = QVBoxLayout(self)
+        self.info_label = QLabel(info or "CRS: unknown")
+        self.info_label.setWordWrap(True)
+        lay.addWidget(self.info_label)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("EPSG:"))
+        self.epsg_input = QLineEdit()
+        self.epsg_input.setPlaceholderText("e.g. 32617")
+        self.epsg_input.setText(epsg)
+        row.addWidget(self.epsg_input)
+        lay.addLayout(row)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+
+# ---------------------------------------------------------------------------
+# Viewport overlays
+# ---------------------------------------------------------------------------
+
+class _ViewCube(QWidget):
+    """Camera orientation widget overlaid in the top-right corner."""
+    view_angle = pyqtSignal(float, float)
+
+    _BTN = (
+        "QPushButton { background:rgba(30,30,30,180); color:#ccc;"
+        " border:1px solid #555; border-radius:3px;"
+        " font:bold 9px; padding:0; min-width:0; }"
+        "QPushButton:hover { background:rgba(0,120,212,200); color:white; }"
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(134, 100)
+        self.setStyleSheet(self._BTN)
+        grid = QGridLayout(self)
+        grid.setSpacing(2)
+        grid.setContentsMargins(2, 2, 2, 2)
+        for label, row, col, el, az in [
+            ("Top",    0, 1,  90,   0),
+            ("Left",   1, 0,   0, -90),
+            ("Front",  1, 1,   0,   0),
+            ("Right",  1, 2,   0,  90),
+            ("Bottom", 2, 1, -90,   0),
+        ]:
+            b = QPushButton(label)
+            b.setFixedSize(40, 24)
+            b.clicked.connect(lambda _, e=el, a=az: self.view_angle.emit(float(e), float(a)))
+            grid.addWidget(b, row, col, Qt.AlignmentFlag.AlignCenter)
+
+    def mousePressEvent(self, event):
+        event.ignore()
+
+    def mouseMoveEvent(self, event):
+        event.ignore()
+
+
+class _ScaleBar(QWidget):
+    """Distance reference bar painted in the bottom-left corner."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(200, 40)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._text = ""
+        self._bar_px = 0
+
+    def refresh(self, camera, viewport_w):
+        dist = getattr(camera, "distance", None) or 500.0
+        fov = getattr(camera, "fov", None) or 45.0
+        half_span = dist * np.tan(np.radians(fov / 2.0))
+        m_per_px = (2.0 * half_span) / max(viewport_w, 1)
+        target = m_per_px * 140
+        nices = [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50,
+                 100, 200, 500, 1000, 2000, 5000, 10000]
+        bar_m = min(nices, key=lambda v: abs(v - target))
+        self._bar_px = max(20, min(int(bar_m / max(m_per_px, 1e-12)), 180))
+        if bar_m >= 1:
+            self._text = "{:g} m".format(bar_m)
+        else:
+            self._text = "{:g} cm".format(bar_m * 100)
+        self.update()
+
+    def paintEvent(self, _event):
+        if not self._bar_px:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        x0, y = 10, 28
+        x1 = x0 + self._bar_px
+        pen = QPen(QColor(200, 200, 200))
+        pen.setWidth(2)
+        p.setPen(pen)
+        p.drawLine(x0, y, x1, y)
+        p.drawLine(x0, y - 5, x0, y + 5)
+        p.drawLine(x1, y - 5, x1, y + 5)
+        p.setFont(QFont("Segoe UI", 9))
+        p.drawText(x0, y - 8, self._text)
+        p.end()
+
+
+# ---------------------------------------------------------------------------
 # 3-D viewer widget
 # ---------------------------------------------------------------------------
 
@@ -395,6 +616,24 @@ class PointCloudView(QWidget):
         lay.addWidget(self.canvas.native)
         self._pts = self._colors = None
         self._size = 2
+
+        self.view_cube = _ViewCube(self)
+        self.scale_bar = _ScaleBar(self)
+        self.canvas.events.draw.connect(self._on_draw)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._place_overlays()
+
+    def _place_overlays(self):
+        w, h = self.width(), self.height()
+        self.view_cube.move(w - self.view_cube.width() - 10, 10)
+        self.scale_bar.move(10, h - self.scale_bar.height() - 10)
+        self.view_cube.raise_()
+        self.scale_bar.raise_()
+
+    def _on_draw(self, _ev=None):
+        self.scale_bar.refresh(self.view.camera, self.canvas.size[0])
 
     def display(self, points, colors, size=2):
         self._pts, self._colors, self._size = points, colors, size
@@ -423,302 +662,91 @@ class PointCloudView(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Control panel
+# Side panel  (file section only)
 # ---------------------------------------------------------------------------
 
 class ControlPanel(QWidget):
     file_requested = pyqtSignal()
-    color_changed = pyqtSignal(str)
-    point_size_changed = pyqtSignal(int)
     max_points_changed = pyqtSignal(int)
-    bg_toggled = pyqtSignal()
-    reset_camera = pyqtSignal()
-    view_preset = pyqtSignal(str)
-    sor_requested = pyqtSignal(int, float)
-    voxel_requested = pyqtSignal(float)
-    elev_requested = pyqtSignal(float, float)
-    ground_requested = pyqtSignal(float, float)
-    hide_nonground_toggled = pyqtSignal(bool)
-    reset_processing = pyqtSignal()
-    satellite_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self.setFixedWidth(290)
+        self.setFixedWidth(220)
         self._build()
 
     def _build(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         inner = QWidget()
         col = QVBoxLayout(inner)
         col.setSpacing(6)
         col.setContentsMargins(8, 8, 8, 8)
 
-        col.addWidget(self._file_section())
-        col.addWidget(self._display_section())
-        col.addWidget(self._perf_section())
-        col.addWidget(self._camera_section())
-        col.addWidget(self._processing_section())
-        col.addWidget(self._satellite_section())
-        col.addStretch()
-
-        scroll.setWidget(inner)
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.addWidget(scroll)
-
-    # -- sections -----------------------------------------------------------
-
-    def _file_section(self):
         g = QGroupBox("File")
         lay = QVBoxLayout(g)
+
         self.load_btn = QPushButton("Open LAS / LAZ File")
         self.load_btn.clicked.connect(self.file_requested.emit)
         lay.addWidget(self.load_btn)
+
         self.file_info = QLabel("No file loaded")
         self.file_info.setWordWrap(True)
         self.file_info.setStyleSheet("color:#888; font-size:11px;")
         lay.addWidget(self.file_info)
+
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.hide()
         lay.addWidget(self.progress)
-        return g
 
-    def _display_section(self):
-        g = QGroupBox("Display")
-        lay = QVBoxLayout(g)
-        lay.addWidget(QLabel("Color By:"))
-        self.color_combo = QComboBox()
-        self.color_combo.addItem("Elevation")
-        self.color_combo.currentTextChanged.connect(self.color_changed.emit)
-        lay.addWidget(self.color_combo)
-
-        lay.addWidget(QLabel("Point Size:"))
-        row = QHBoxLayout()
-        self.size_slider = QSlider(Qt.Orientation.Horizontal)
-        self.size_slider.setRange(1, 15)
-        self.size_slider.setValue(2)
-        self.size_label = QLabel("2")
-        self.size_slider.valueChanged.connect(self.point_size_changed.emit)
-        self.size_slider.valueChanged.connect(lambda v: self.size_label.setText(str(v)))
-        row.addWidget(self.size_slider)
-        row.addWidget(self.size_label)
-        lay.addLayout(row)
-
-        self.bg_btn = QPushButton("Toggle Background")
-        self.bg_btn.clicked.connect(self.bg_toggled.emit)
-        lay.addWidget(self.bg_btn)
-        return g
-
-    def _perf_section(self):
-        g = QGroupBox("Performance")
-        lay = QVBoxLayout(g)
         lay.addWidget(QLabel("Max Points (millions):"))
         row = QHBoxLayout()
         self.max_pts_slider = QSlider(Qt.Orientation.Horizontal)
         self.max_pts_slider.setRange(1, 100)
         self.max_pts_slider.setValue(10)
         self.max_pts_label = QLabel("10 M")
-        self.max_pts_slider.valueChanged.connect(lambda v: self.max_pts_label.setText("{} M".format(v)))
+        self.max_pts_slider.valueChanged.connect(
+            lambda v: self.max_pts_label.setText("{} M".format(v))
+        )
         row.addWidget(self.max_pts_slider)
         row.addWidget(self.max_pts_label)
         lay.addLayout(row)
+
         self.reload_btn = QPushButton("Reload with New Limit")
         self.reload_btn.setEnabled(False)
-        self.reload_btn.clicked.connect(lambda: self.max_points_changed.emit(self.max_pts_slider.value() * 1_000_000))
-        lay.addWidget(self.reload_btn)
-        return g
-
-    def _camera_section(self):
-        g = QGroupBox("Camera")
-        lay = QVBoxLayout(g)
-        btn = QPushButton("Reset Camera")
-        btn.clicked.connect(self.reset_camera.emit)
-        lay.addWidget(btn)
-        row = QHBoxLayout()
-        for name in ("Top", "Front", "Right"):
-            b = QPushButton(name)
-            b.setFixedWidth(78)
-            b.clicked.connect(lambda _, n=name: self.view_preset.emit(n))
-            row.addWidget(b)
-        lay.addLayout(row)
-        return g
-
-    def _processing_section(self):
-        g = QGroupBox("Post-Processing")
-        lay = QVBoxLayout(g)
-
-        # SOR
-        lay.addWidget(QLabel("Statistical Outlier Removal"))
-        r = QHBoxLayout()
-        r.addWidget(QLabel("K:"))
-        self.sor_k = QSpinBox(); self.sor_k.setRange(5, 200); self.sor_k.setValue(20)
-        r.addWidget(self.sor_k)
-        r.addWidget(QLabel("Std:"))
-        self.sor_std = QDoubleSpinBox()
-        self.sor_std.setRange(0.1, 10.0); self.sor_std.setValue(2.0); self.sor_std.setSingleStep(0.1)
-        r.addWidget(self.sor_std)
-        lay.addLayout(r)
-        self.sor_btn = QPushButton("Remove Outliers")
-        self.sor_btn.setEnabled(False)
-        self.sor_btn.clicked.connect(lambda: self.sor_requested.emit(self.sor_k.value(), self.sor_std.value()))
-        lay.addWidget(self.sor_btn)
-
-        # Voxel
-        lay.addWidget(QLabel("Voxel Downsampling"))
-        r2 = QHBoxLayout()
-        r2.addWidget(QLabel("Size:"))
-        self.voxel_size = QDoubleSpinBox()
-        self.voxel_size.setRange(0.001, 50.0); self.voxel_size.setValue(0.10)
-        self.voxel_size.setSingleStep(0.01); self.voxel_size.setDecimals(3)
-        r2.addWidget(self.voxel_size)
-        lay.addLayout(r2)
-        self.voxel_btn = QPushButton("Downsample")
-        self.voxel_btn.setEnabled(False)
-        self.voxel_btn.clicked.connect(lambda: self.voxel_requested.emit(self.voxel_size.value()))
-        lay.addWidget(self.voxel_btn)
-
-        # Elevation clip
-        lay.addWidget(QLabel("Elevation Clip"))
-        r3 = QHBoxLayout()
-        r3.addWidget(QLabel("Z min:"))
-        self.z_min = QDoubleSpinBox(); self.z_min.setRange(-100000, 100000); self.z_min.setDecimals(2)
-        r3.addWidget(self.z_min)
-        r3.addWidget(QLabel("Z max:"))
-        self.z_max = QDoubleSpinBox(); self.z_max.setRange(-100000, 100000); self.z_max.setValue(1000); self.z_max.setDecimals(2)
-        r3.addWidget(self.z_max)
-        lay.addLayout(r3)
-        self.elev_btn = QPushButton("Clip Elevation")
-        self.elev_btn.setEnabled(False)
-        self.elev_btn.clicked.connect(lambda: self.elev_requested.emit(self.z_min.value(), self.z_max.value()))
-        lay.addWidget(self.elev_btn)
-
-        # Ground segmentation
-        lay.addWidget(QLabel("Ground Segmentation"))
-        r4 = QHBoxLayout()
-        r4.addWidget(QLabel("Cell:"))
-        self.ground_cell = QDoubleSpinBox()
-        self.ground_cell.setRange(0.1, 20.0); self.ground_cell.setValue(1.0)
-        self.ground_cell.setSingleStep(0.1); self.ground_cell.setDecimals(1)
-        r4.addWidget(self.ground_cell)
-        r4.addWidget(QLabel("Ht:"))
-        self.ground_thresh = QDoubleSpinBox()
-        self.ground_thresh.setRange(0.05, 10.0); self.ground_thresh.setValue(0.3)
-        self.ground_thresh.setSingleStep(0.05); self.ground_thresh.setDecimals(2)
-        r4.addWidget(self.ground_thresh)
-        lay.addLayout(r4)
-        self.ground_btn = QPushButton("Segment Ground")
-        self.ground_btn.setEnabled(False)
-        self.ground_btn.clicked.connect(lambda: self.ground_requested.emit(self.ground_cell.value(), self.ground_thresh.value()))
-        lay.addWidget(self.ground_btn)
-
-        self.ground_info = QLabel("")
-        self.ground_info.setStyleSheet("color:#888; font-size:11px;")
-        self.ground_info.setWordWrap(True)
-        lay.addWidget(self.ground_info)
-
-        from PyQt6.QtWidgets import QCheckBox
-        self.hide_nonground_cb = QCheckBox("Hide Non-Ground Points")
-        self.hide_nonground_cb.setEnabled(False)
-        self.hide_nonground_cb.toggled.connect(self.hide_nonground_toggled.emit)
-        lay.addWidget(self.hide_nonground_cb)
-
-        # Reset
-        self.reset_btn = QPushButton("Reset to Original")
-        self.reset_btn.setStyleSheet("background-color:#c42b1c; color:white;")
-        self.reset_btn.setEnabled(False)
-        self.reset_btn.clicked.connect(self.reset_processing.emit)
-        lay.addWidget(self.reset_btn)
-        return g
-
-    def _satellite_section(self):
-        g = QGroupBox("Satellite Texture")
-        lay = QVBoxLayout(g)
-
-        self.crs_label = QLabel("CRS: unknown")
-        self.crs_label.setStyleSheet("color:#888; font-size:11px;")
-        self.crs_label.setWordWrap(True)
-        lay.addWidget(self.crs_label)
-
-        r = QHBoxLayout()
-        r.addWidget(QLabel("EPSG:"))
-        self.epsg_input = QLineEdit()
-        self.epsg_input.setPlaceholderText("e.g. 32617")
-        self.epsg_input.setFixedWidth(100)
-        r.addWidget(self.epsg_input)
-        lay.addLayout(r)
-
-        self.sat_btn = QPushButton("Apply Satellite Texture")
-        self.sat_btn.setEnabled(False)
-        self.sat_btn.setToolTip(
-            "Fetch Esri World Imagery and colorize each point\n"
-            "with its satellite photo colour for a GIS terrain view."
+        self.reload_btn.clicked.connect(
+            lambda: self.max_points_changed.emit(
+                self.max_pts_slider.value() * 1_000_000
+            )
         )
-        self.sat_btn.clicked.connect(self.satellite_requested.emit)
-        lay.addWidget(self.sat_btn)
+        lay.addWidget(self.reload_btn)
 
-        self.sat_info = QLabel("")
-        self.sat_info.setStyleSheet("color:#888; font-size:11px;")
-        self.sat_info.setWordWrap(True)
-        lay.addWidget(self.sat_info)
-        return g
+        col.addWidget(g)
+        col.addStretch()
+        scroll.setWidget(inner)
 
-    # -- helpers ------------------------------------------------------------
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(scroll)
 
     def set_loading(self, busy):
         self.load_btn.setEnabled(not busy)
         self.progress.setVisible(busy)
 
-    def update_for_data(self, data):
+    def update_file_info(self, data):
         self.file_info.setText(
             "{}\nTotal: {:,}\nDisplayed: {:,}\nLoaded in {:.1f}s".format(
                 os.path.basename(data["filepath"]),
-                data["total_points"], data["displayed_points"], data["load_time"],
+                data["total_points"],
+                data["displayed_points"],
+                data["load_time"],
             )
         )
         self.file_info.setStyleSheet("color:#bbb; font-size:11px;")
-
-        self.color_combo.blockSignals(True)
-        self.color_combo.clear()
-        for opt in data["available_coloring"]:
-            self.color_combo.addItem(opt)
-        self.color_combo.blockSignals(False)
-        self.color_combo.setCurrentText(
-            "RGB" if "RGB" in data["available_coloring"] else "Elevation"
-        )
-
-        for b in (self.sor_btn, self.voxel_btn, self.elev_btn,
-                   self.reset_btn, self.reload_btn, self.ground_btn,
-                   self.sat_btn):
-            b.setEnabled(True)
-
-        z = data["points"][:, 2]
-        self.z_min.setValue(float(z.min()))
-        self.z_max.setValue(float(z.max()))
-
-        crs_info = data.get("crs_info", "")
-        crs_epsg = data.get("crs_epsg")
-        coord_hint = data.get("coord_hint", "")
-
-        if crs_info:
-            self.crs_label.setText("CRS: " + crs_info)
-            self.crs_label.setStyleSheet("color:#6c6; font-size:11px;")
-            if crs_epsg:
-                self.epsg_input.setText(str(crs_epsg))
-        elif coord_hint:
-            self.crs_label.setText("CRS: not in file\n" + coord_hint)
-            self.crs_label.setStyleSheet("color:#da5; font-size:11px;")
-            self.epsg_input.clear()
-        else:
-            self.crs_label.setText("CRS: not found (set EPSG)")
-            self.crs_label.setStyleSheet("color:#c66; font-size:11px;")
-            self.epsg_input.clear()
-
-        self.ground_info.setText("")
-        self.sat_info.setText("")
+        self.reload_btn.setEnabled(True)
 
 
 # ---------------------------------------------------------------------------
@@ -737,20 +765,35 @@ class LiDARViewer(QMainWindow):
         self._mask = None
         self._ground_mask = None
         self._hide_nonground = False
-        self._sat_colors = None          # (N,4) satellite RGBA for full cloud
+        self._sat_colors = None
         self._dark_bg = True
         self._filepath = None
         self._loader = None
         self._worker = None
         self._sat_worker = None
 
+        self._sor_k = 20
+        self._sor_std = 2.0
+        self._voxel_size = 0.10
+        self._z_min = 0.0
+        self._z_max = 1000.0
+        self._ground_cell = 1.0
+        self._ground_ht = 0.3
+        self._epsg_text = ""
+        self._crs_display = ""
+
         self._build_ui()
-        self._build_menu()
+        self._build_menus()
+        self._build_toolbar()
         self._wire()
 
-        self._las_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "LiDAR_LAS")
+        self._las_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "LiDAR_LAS"
+        )
         if not os.path.isdir(self._las_dir):
             self._las_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # -- layout -------------------------------------------------------------
 
     def _build_ui(self):
         central = QWidget()
@@ -764,50 +807,192 @@ class LiDARViewer(QMainWindow):
         splitter.addWidget(self.controls)
         self.viewer = PointCloudView()
         splitter.addWidget(self.viewer)
-        splitter.setSizes([290, 1150])
+        splitter.setSizes([220, 1220])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         root.addWidget(splitter)
 
-        self.status = QLabel("Ready  -  Ctrl+O to open a LAS file")
+        self.status = QLabel("Ready  \u2014  Ctrl+O to open a LAS file")
         bar = QStatusBar()
         bar.addPermanentWidget(self.status)
         self.setStatusBar(bar)
 
-    def _build_menu(self):
+    def _build_menus(self):
         mb = self.menuBar()
-        fm = mb.addMenu("&File")
-        a = QAction("&Open LAS/LAZ...", self); a.setShortcut("Ctrl+O")
-        a.triggered.connect(self._open_dialog); fm.addAction(a)
-        fm.addSeparator()
-        a2 = QAction("E&xit", self); a2.setShortcut("Ctrl+Q")
-        a2.triggered.connect(self.close); fm.addAction(a2)
 
+        # File
+        fm = mb.addMenu("&File")
+        a = QAction("&Open LAS/LAZ\u2026", self)
+        a.setShortcut("Ctrl+O")
+        a.triggered.connect(self._open_dialog)
+        fm.addAction(a)
+        fm.addSeparator()
+        a2 = QAction("E&xit", self)
+        a2.setShortcut("Ctrl+Q")
+        a2.triggered.connect(self.close)
+        fm.addAction(a2)
+
+        # View
         vm = mb.addMenu("&View")
-        ra = QAction("&Reset Camera", self); ra.setShortcut("R")
-        ra.triggered.connect(self.viewer.reset_camera); vm.addAction(ra)
+        ra = QAction("&Reset Camera", self)
+        ra.setShortcut("R")
+        ra.triggered.connect(self.viewer.reset_camera)
+        vm.addAction(ra)
         vm.addSeparator()
-        for label, key, el, az in [("Top","Ctrl+1",90,0),("Front","Ctrl+2",0,0),("Right","Ctrl+3",0,90)]:
-            va = QAction("{} View".format(label), self); va.setShortcut(key)
-            va.triggered.connect(lambda _, e=el, a=az: self.viewer.set_camera_angles(e, a))
+        for label, key, el, az in [
+            ("Top", "Ctrl+1", 90, 0),
+            ("Front", "Ctrl+2", 0, 0),
+            ("Right", "Ctrl+3", 0, 90),
+        ]:
+            va = QAction("{} View".format(label), self)
+            va.setShortcut(key)
+            va.triggered.connect(
+                lambda _, e=el, a=az: self.viewer.set_camera_angles(e, a)
+            )
             vm.addAction(va)
 
+        # Processing
+        pm = mb.addMenu("&Processing")
+        self._act_sor = QAction("Statistical Outlier Removal\u2026", self)
+        self._act_sor.setEnabled(False)
+        self._act_sor.triggered.connect(self._dlg_sor)
+        pm.addAction(self._act_sor)
+
+        self._act_voxel = QAction("Voxel Downsample\u2026", self)
+        self._act_voxel.setEnabled(False)
+        self._act_voxel.triggered.connect(self._dlg_voxel)
+        pm.addAction(self._act_voxel)
+
+        self._act_elev = QAction("Elevation Clip\u2026", self)
+        self._act_elev.setEnabled(False)
+        self._act_elev.triggered.connect(self._dlg_elev)
+        pm.addAction(self._act_elev)
+
+        pm.addSeparator()
+
+        self._act_ground = QAction("Ground Segmentation\u2026", self)
+        self._act_ground.setEnabled(False)
+        self._act_ground.triggered.connect(self._dlg_ground)
+        pm.addAction(self._act_ground)
+
+        self._act_hide_ng = QAction("Hide Non-Ground Points", self)
+        self._act_hide_ng.setCheckable(True)
+        self._act_hide_ng.setEnabled(False)
+        self._act_hide_ng.toggled.connect(self._toggle_nonground)
+        pm.addAction(self._act_hide_ng)
+
+        pm.addSeparator()
+
+        self._act_sat = QAction("Apply Satellite Texture\u2026", self)
+        self._act_sat.setEnabled(False)
+        self._act_sat.triggered.connect(self._dlg_satellite)
+        pm.addAction(self._act_sat)
+
+        pm.addSeparator()
+
+        self._act_reset = QAction("Reset to Original", self)
+        self._act_reset.setEnabled(False)
+        self._act_reset.triggered.connect(self._reset_proc)
+        pm.addAction(self._act_reset)
+
+    def _build_toolbar(self):
+        tb = QToolBar("Display")
+        tb.setMovable(False)
+        tb.setIconSize(QSize(16, 16))
+        tb.setStyleSheet(
+            "QToolBar { spacing:6px; padding:2px 6px; }"
+            "QToolBar QLabel { color:#aaa; font-size:11px; background:transparent; }"
+        )
+        self.addToolBar(tb)
+
+        tb.addWidget(QLabel(" Color:"))
+        self.color_combo = QComboBox()
+        self.color_combo.addItem("Elevation")
+        self.color_combo.setMinimumWidth(110)
+        self.color_combo.currentTextChanged.connect(lambda _: self._render())
+        tb.addWidget(self.color_combo)
+
+        tb.addSeparator()
+
+        tb.addWidget(QLabel(" Size:"))
+        self.size_combo = QComboBox()
+        for i in range(1, 11):
+            self.size_combo.addItem(str(i))
+        self.size_combo.setCurrentIndex(1)
+        self.size_combo.setFixedWidth(50)
+        self.size_combo.currentTextChanged.connect(self._on_size_change)
+        tb.addWidget(self.size_combo)
+
+        tb.addSeparator()
+
+        bg_btn = QPushButton("BG")
+        bg_btn.setToolTip("Toggle Background")
+        bg_btn.setFixedSize(32, 24)
+        bg_btn.setStyleSheet(
+            "QPushButton { background:#3c3c3c; border:1px solid #555;"
+            " border-radius:3px; color:#ccc; font:bold 10px; }"
+            "QPushButton:hover { background:#0078d4; color:white; }"
+        )
+        bg_btn.clicked.connect(self._toggle_bg)
+        tb.addWidget(bg_btn)
+
+        tb.addSeparator()
+
+        self.ground_label = QLabel("")
+        self.ground_label.setStyleSheet(
+            "color:#999; font-size:11px; background:transparent;"
+        )
+        tb.addWidget(self.ground_label)
+
     def _wire(self):
-        c = self.controls
-        c.file_requested.connect(self._open_dialog)
-        c.color_changed.connect(lambda _: self._render())
-        c.point_size_changed.connect(self.viewer.update_size)
-        c.bg_toggled.connect(self._toggle_bg)
-        c.reset_camera.connect(self.viewer.reset_camera)
-        c.view_preset.connect(self._view_preset)
-        c.max_points_changed.connect(self._reload)
-        c.sor_requested.connect(lambda k, s: self._run_proc("sor", k=k, std_ratio=s))
-        c.voxel_requested.connect(lambda v: self._run_proc("voxel", voxel_size=v))
-        c.elev_requested.connect(lambda lo, hi: self._run_proc("elevation", z_min=lo, z_max=hi))
-        c.ground_requested.connect(self._run_ground_seg)
-        c.hide_nonground_toggled.connect(self._toggle_nonground)
-        c.reset_processing.connect(self._reset_proc)
-        c.satellite_requested.connect(self._run_satellite)
+        self.controls.file_requested.connect(self._open_dialog)
+        self.controls.max_points_changed.connect(self._reload)
+        self.viewer.view_cube.view_angle.connect(self.viewer.set_camera_angles)
+
+    # -- helpers ------------------------------------------------------------
+
+    def _on_size_change(self, text):
+        if text.isdigit():
+            self.viewer.update_size(int(text))
+
+    def _current_size(self):
+        t = self.size_combo.currentText()
+        return int(t) if t.isdigit() else 2
+
+    # -- dialog launchers ---------------------------------------------------
+
+    def _dlg_sor(self):
+        d = _SORDialog(self, self._sor_k, self._sor_std)
+        if d.exec():
+            self._sor_k = d.k_spin.value()
+            self._sor_std = d.std_spin.value()
+            self._run_proc("sor", k=self._sor_k, std_ratio=self._sor_std)
+
+    def _dlg_voxel(self):
+        d = _VoxelDialog(self, self._voxel_size)
+        if d.exec():
+            self._voxel_size = d.size_spin.value()
+            self._run_proc("voxel", voxel_size=self._voxel_size)
+
+    def _dlg_elev(self):
+        d = _ElevClipDialog(self, self._z_min, self._z_max)
+        if d.exec():
+            self._z_min = d.z_min_spin.value()
+            self._z_max = d.z_max_spin.value()
+            self._run_proc("elevation", z_min=self._z_min, z_max=self._z_max)
+
+    def _dlg_ground(self):
+        d = _GroundSegDialog(self, self._ground_cell, self._ground_ht)
+        if d.exec():
+            self._ground_cell = d.cell_spin.value()
+            self._ground_ht = d.ht_spin.value()
+            self._run_ground_seg(self._ground_cell, self._ground_ht)
+
+    def _dlg_satellite(self):
+        d = _SatelliteDialog(self, self._crs_display, self._epsg_text)
+        if d.exec():
+            self._epsg_text = d.epsg_input.text().strip()
+            self._run_satellite()
 
     # -- file I/O -----------------------------------------------------------
 
@@ -838,7 +1023,40 @@ class LiDARViewer(QMainWindow):
         self._ground_mask = None
         self._sat_colors = None
         self.controls.set_loading(False)
-        self.controls.update_for_data(data)
+        self.controls.update_file_info(data)
+
+        self.color_combo.blockSignals(True)
+        self.color_combo.clear()
+        for opt in data["available_coloring"]:
+            self.color_combo.addItem(opt)
+        self.color_combo.blockSignals(False)
+        self.color_combo.setCurrentText(
+            "RGB" if "RGB" in data["available_coloring"] else "Elevation"
+        )
+
+        for act in (self._act_sor, self._act_voxel, self._act_elev,
+                     self._act_ground, self._act_sat, self._act_reset):
+            act.setEnabled(True)
+
+        z = data["points"][:, 2]
+        self._z_min = float(z.min())
+        self._z_max = float(z.max())
+
+        crs_info = data.get("crs_info", "")
+        crs_epsg = data.get("crs_epsg")
+        coord_hint = data.get("coord_hint", "")
+        if crs_info:
+            self._crs_display = "CRS: " + crs_info
+            if crs_epsg:
+                self._epsg_text = str(crs_epsg)
+        elif coord_hint:
+            self._crs_display = "CRS: not in file\n" + coord_hint
+            self._epsg_text = ""
+        else:
+            self._crs_display = "CRS: not found"
+            self._epsg_text = ""
+
+        self.ground_label.setText("")
         self._render()
         self.status.setText("{:,} / {:,} pts | {:.1f}s".format(
             data["displayed_points"], data["total_points"], data["load_time"],
@@ -867,7 +1085,7 @@ class LiDARViewer(QMainWindow):
         if not self._cloud:
             return
         pts, attrs = self._active_data()
-        mode = self.controls.color_combo.currentText()
+        mode = self.color_combo.currentText()
 
         if mode == "Satellite" and self._sat_colors is not None:
             colors = self._sat_colors
@@ -883,7 +1101,6 @@ class LiDARViewer(QMainWindow):
         else:
             colors = compute_colors(pts, attrs, mode)
 
-        # Hide non-ground points when the toggle is active
         if self._hide_nonground and self._ground_mask is not None:
             gm = self._ground_mask
             if self._mask is not None:
@@ -891,16 +1108,11 @@ class LiDARViewer(QMainWindow):
             pts = pts[gm]
             colors = colors[gm]
 
-        self.viewer.display(pts, colors, self.controls.size_slider.value())
+        self.viewer.display(pts, colors, self._current_size())
 
     def _toggle_bg(self):
         self._dark_bg = not self._dark_bg
         self.viewer.set_bg("#1a1a2e" if self._dark_bg else "#e0e0e0")
-
-    def _view_preset(self, name):
-        angles = {"Top": (90, 0), "Front": (0, 0), "Right": (0, 90)}
-        el, az = angles.get(name, (0, 0))
-        self.viewer.set_camera_angles(el, az)
 
     # -- processing ---------------------------------------------------------
 
@@ -928,7 +1140,7 @@ class LiDARViewer(QMainWindow):
         kept = int(self._mask.sum())
         removed = self._cloud["displayed_points"] - kept
         self._render()
-        self.status.setText("Done - {:,} kept, {:,} removed".format(kept, removed))
+        self.status.setText("Done \u2014 {:,} kept, {:,} removed".format(kept, removed))
 
     def _on_proc_err(self, msg):
         self.controls.set_loading(False)
@@ -947,7 +1159,10 @@ class LiDARViewer(QMainWindow):
         pts, _ = self._active_data()
         self.controls.set_loading(True)
         self.status.setText("Running ground segmentation...")
-        self._worker = ProcessingThread("ground", pts, cell_size=cell_size, height_threshold=height_threshold)
+        self._worker = ProcessingThread(
+            "ground", pts,
+            cell_size=cell_size, height_threshold=height_threshold,
+        )
         self._worker.progress.connect(self.status.setText)
         self._worker.finished.connect(self._on_ground_done)
         self._worker.error.connect(self._on_proc_err)
@@ -965,14 +1180,20 @@ class LiDARViewer(QMainWindow):
 
         n_g = int(ground_mask.sum())
         n_t = len(ground_mask)
-        self.controls.ground_info.setText(
-            "Ground: {:,} ({:.1f}%) | Non-ground: {:,}".format(n_g, 100.0 * n_g / max(n_t, 1), n_t - n_g)
+        self.ground_label.setText(
+            "Ground: {:,} ({:.1f}%) | Non-ground: {:,}".format(
+                n_g, 100.0 * n_g / max(n_t, 1), n_t - n_g
+            )
         )
-        self.status.setText("Ground seg done - {:,} ground, {:,} non-ground".format(n_g, n_t - n_g))
+        self.status.setText(
+            "Ground seg done \u2014 {:,} ground, {:,} non-ground".format(
+                n_g, n_t - n_g
+            )
+        )
 
-        self.controls.hide_nonground_cb.setEnabled(True)
+        self._act_hide_ng.setEnabled(True)
         self._add_color_mode("Ground")
-        self.controls.color_combo.setCurrentText("Ground")
+        self.color_combo.setCurrentText("Ground")
         self._render()
 
     # -- satellite texture --------------------------------------------------
@@ -983,18 +1204,18 @@ class LiDARViewer(QMainWindow):
         if self._sat_worker and self._sat_worker.isRunning():
             return
 
-        epsg_text = self.controls.epsg_input.text().strip()
         epsg_override = None
-        if epsg_text:
+        if self._epsg_text:
             try:
-                epsg_override = int(epsg_text)
+                epsg_override = int(self._epsg_text)
             except ValueError:
-                QMessageBox.warning(self, "Invalid EPSG", "EPSG must be an integer.")
+                QMessageBox.warning(
+                    self, "Invalid EPSG", "EPSG must be an integer."
+                )
                 return
 
         self.controls.set_loading(True)
         self.status.setText("Fetching satellite imagery...")
-        self.controls.sat_info.setText("Working...")
 
         self._sat_worker = SatelliteThread(self._cloud, epsg_override)
         self._sat_worker.progress.connect(self.status.setText)
@@ -1008,30 +1229,19 @@ class LiDARViewer(QMainWindow):
         info = result.get("info", {})
         self._sat_colors = colors
 
-        crs_name = info.get("crs_name", "?")
         crs_epsg = info.get("crs_epsg")
-        lat_r = info.get("lat_range", (0, 0))
-        lon_r = info.get("lon_range", (0, 0))
-
-        diag = "CRS: {}".format(crs_name)
-        if crs_epsg:
-            diag += " (EPSG:{})".format(crs_epsg)
-        diag += "\nLat: {:.5f} to {:.5f}".format(lat_r[0], lat_r[1])
-        diag += "\nLon: {:.5f} to {:.5f}".format(lon_r[0], lon_r[1])
-        self.controls.sat_info.setText(diag)
-        self.controls.sat_info.setStyleSheet("color:#6c6; font-size:11px;")
-
-        self.status.setText("Satellite texture ready - {:,} pts | EPSG:{}".format(
-            len(colors), crs_epsg or "?",
-        ))
+        self.status.setText(
+            "Satellite texture ready \u2014 {:,} pts | EPSG:{}".format(
+                len(colors), crs_epsg or "?"
+            )
+        )
 
         self._add_color_mode("Satellite")
-        self.controls.color_combo.setCurrentText("Satellite")
+        self.color_combo.setCurrentText("Satellite")
         self._render()
 
     def _on_satellite_err(self, msg):
         self.controls.set_loading(False)
-        self.controls.sat_info.setText("Failed")
         self.status.setText("Satellite texture failed")
         QMessageBox.warning(self, "Satellite Error", msg)
 
@@ -1042,30 +1252,33 @@ class LiDARViewer(QMainWindow):
         self._ground_mask = None
         self._hide_nonground = False
         self._sat_colors = None
-        self.controls.hide_nonground_cb.blockSignals(True)
-        self.controls.hide_nonground_cb.setChecked(False)
-        self.controls.hide_nonground_cb.setEnabled(False)
-        self.controls.hide_nonground_cb.blockSignals(False)
-        self.controls.ground_info.setText("")
-        self.controls.sat_info.setText("")
 
-        self.controls.color_combo.blockSignals(True)
-        self.controls.color_combo.clear()
+        self._act_hide_ng.blockSignals(True)
+        self._act_hide_ng.setChecked(False)
+        self._act_hide_ng.setEnabled(False)
+        self._act_hide_ng.blockSignals(False)
+
+        self.ground_label.setText("")
+
+        self.color_combo.blockSignals(True)
+        self.color_combo.clear()
         for opt in self._cloud["available_coloring"]:
-            self.controls.color_combo.addItem(opt)
-        self.controls.color_combo.blockSignals(False)
-        self.controls.color_combo.setCurrentText("Elevation")
+            self.color_combo.addItem(opt)
+        self.color_combo.blockSignals(False)
+        self.color_combo.setCurrentText("Elevation")
 
         self._render()
-        self.status.setText("Reset - {:,} points".format(self._cloud["displayed_points"]))
+        self.status.setText(
+            "Reset \u2014 {:,} points".format(self._cloud["displayed_points"])
+        )
 
     # -- helpers ------------------------------------------------------------
 
     def _add_color_mode(self, name):
-        items = [self.controls.color_combo.itemText(i)
-                 for i in range(self.controls.color_combo.count())]
+        items = [self.color_combo.itemText(i)
+                 for i in range(self.color_combo.count())]
         if name not in items:
-            self.controls.color_combo.addItem(name)
+            self.color_combo.addItem(name)
 
 
 # ---------------------------------------------------------------------------
