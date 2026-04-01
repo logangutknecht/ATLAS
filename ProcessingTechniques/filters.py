@@ -1,7 +1,7 @@
 """Point-cloud filters: outlier removal, downsampling, ground segmentation."""
 
 import numpy as np
-from scipy.ndimage import minimum_filter, maximum_filter
+from scipy.ndimage import minimum_filter, maximum_filter, uniform_filter
 from scipy.spatial import cKDTree, Delaunay
 
 
@@ -43,6 +43,90 @@ def elevation_clip(points, z_min, z_max):
     """Return a boolean mask keeping points within [z_min, z_max]."""
     z = points[:, 2]
     return (z >= z_min) & (z <= z_max)
+
+
+def detect_ground_anomalies(points, ground_mask, cell_size=0.5,
+                            threshold=0.10, radius=3.0, progress_fn=None):
+    """Detect ground-surface anomalies: bumps (positive) and dips (negative).
+
+    Builds a smoothed reference ground surface by averaging ground-point
+    elevations over a sliding window of the given *radius*.  Ground points
+    whose elevation deviates from the reference by more than *threshold*
+    are labelled as anomalies.
+
+    Parameters
+    ----------
+    points : (N, 3) ndarray
+    ground_mask : (N,) bool ndarray
+    cell_size : float – grid resolution for the elevation map.
+    threshold : float – minimum |deviation| to flag as anomaly.
+    radius : float – smoothing radius (metres) for the reference surface.
+        Features smaller than ~2 * radius are treated as anomalies.
+    progress_fn : callable, optional
+
+    Returns
+    -------
+    labels : (N,) int8 ndarray
+        +1 = positive anomaly (bump / mound / rock),
+        -1 = negative anomaly (pothole / depression),
+         0 = normal ground or non-ground point.
+    """
+    gnd_idx = np.where(ground_mask)[0]
+    if len(gnd_idx) < 10:
+        return np.zeros(len(points), dtype=np.int8)
+
+    if progress_fn:
+        progress_fn("Anomaly: building elevation grid...")
+
+    xy = points[gnd_idx, :2].astype(np.float64)
+    z = points[gnd_idx, 2].astype(np.float64)
+
+    mn = xy.min(axis=0)
+    span = xy.max(axis=0) - mn
+    cs = max(float(cell_size), 0.01)
+    nx = max(int(np.ceil(span[0] / cs)), 1)
+    ny = max(int(np.ceil(span[1] / cs)), 1)
+
+    gi = np.clip(((xy[:, 0] - mn[0]) / cs).astype(np.int32), 0, nx - 1)
+    gj = np.clip(((xy[:, 1] - mn[1]) / cs).astype(np.int32), 0, ny - 1)
+
+    # Mean Z per cell
+    grid_sum = np.zeros((ny, nx), dtype=np.float64)
+    grid_cnt = np.zeros((ny, nx), dtype=np.float64)
+    np.add.at(grid_sum, (gj, gi), z)
+    np.add.at(grid_cnt, (gj, gi), 1.0)
+
+    has_data = grid_cnt > 0
+    grid_z = np.where(has_data, grid_sum / np.maximum(grid_cnt, 1), 0.0)
+    data_flag = has_data.astype(np.float64)
+
+    # NaN-safe moving average: filter sum and count separately, then divide
+    win = max(3, int(np.ceil(2.0 * radius / cs)) | 1)
+    if progress_fn:
+        progress_fn("Anomaly: smoothing reference ({} cell window)...".format(win))
+
+    smooth_sum = uniform_filter(grid_z, size=win, mode="constant", cval=0.0)
+    smooth_cnt = uniform_filter(data_flag, size=win, mode="constant", cval=0.0)
+    ref = np.where(smooth_cnt > 0, smooth_sum / smooth_cnt, np.nan)
+
+    if progress_fn:
+        progress_fn("Anomaly: classifying {:,} ground points...".format(len(gnd_idx)))
+
+    ref_z = ref[gj, gi]
+    valid = np.isfinite(ref_z)
+    deviation = z - ref_z
+
+    labels = np.zeros(len(points), dtype=np.int8)
+    labels[gnd_idx[valid & (deviation > threshold)]] = 1     # bump
+    labels[gnd_idx[valid & (deviation < -threshold)]] = -1   # dip
+
+    if progress_fn:
+        n_bump = int((labels == 1).sum())
+        n_dip = int((labels == -1).sum())
+        progress_fn("Found {:,} bumps + {:,} dips in {:,} ground".format(
+            n_bump, n_dip, len(gnd_idx)))
+
+    return labels
 
 
 # ---------------------------------------------------------------------------

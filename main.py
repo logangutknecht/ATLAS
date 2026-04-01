@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QGridLayout,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QAction, QPainter, QPen, QFont, QColor
+from PyQt6.QtGui import QAction, QActionGroup, QPainter, QPen, QFont, QColor
 
 from vispy import scene
 from vispy.color import Colormap, get_colormap
@@ -37,7 +37,7 @@ from ProcessingTechniques.geo import (
 )
 from ProcessingTechniques.filters import (
     statistical_outlier_removal, voxel_downsample,
-    elevation_clip, ground_segmentation,
+    elevation_clip, ground_segmentation, detect_ground_anomalies,
 )
 from ProcessingTechniques.satellite import generate_satellite_colors
 
@@ -291,6 +291,10 @@ class ProcessingThread(QThread):
                 mask = elevation_clip(self.pts, self.kw["z_min"], self.kw["z_max"])
             elif self.op == "ground":
                 mask = ground_segmentation(self.pts, self.kw["cell_size"], self.kw["height_threshold"], pfn)
+            elif self.op == "anomaly":
+                mask = detect_ground_anomalies(
+                    self.pts, self.kw["ground_mask"], self.kw["cell_size"],
+                    self.kw["threshold"], self.kw["radius"], pfn)
             else:
                 raise ValueError("Unknown op: " + self.op)
             self.finished.emit(mask)
@@ -485,6 +489,53 @@ class _GroundSegDialog(QDialog):
         lay.addWidget(bb)
 
 
+class _AnomalyDialog(QDialog):
+    def __init__(self, parent=None, cell=0.5, threshold=0.10, radius=3.0):
+        super().__init__(parent)
+        self.setWindowTitle("Detect Ground Anomalies")
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "Detects bumps (rocks, mounds) and dips (potholes, craters)\n"
+            "by comparing ground points to a smoothed reference surface."
+        ))
+        r1 = QHBoxLayout()
+        r1.addWidget(QLabel("Cell size:"))
+        self.cell_spin = QDoubleSpinBox()
+        self.cell_spin.setRange(0.05, 20.0)
+        self.cell_spin.setValue(cell)
+        self.cell_spin.setSingleStep(0.1)
+        self.cell_spin.setDecimals(2)
+        r1.addWidget(self.cell_spin)
+        r1.addWidget(QLabel("Threshold:"))
+        self.thresh_spin = QDoubleSpinBox()
+        self.thresh_spin.setRange(0.01, 50.0)
+        self.thresh_spin.setValue(threshold)
+        self.thresh_spin.setSingleStep(0.01)
+        self.thresh_spin.setDecimals(2)
+        self.thresh_spin.setToolTip("Minimum deviation from the reference surface")
+        r1.addWidget(self.thresh_spin)
+        lay.addLayout(r1)
+        r2 = QHBoxLayout()
+        r2.addWidget(QLabel("Smoothing radius:"))
+        self.radius_spin = QDoubleSpinBox()
+        self.radius_spin.setRange(0.5, 100.0)
+        self.radius_spin.setValue(radius)
+        self.radius_spin.setSingleStep(0.5)
+        self.radius_spin.setDecimals(1)
+        self.radius_spin.setToolTip(
+            "Features smaller than ~2x this radius are flagged as anomalies"
+        )
+        r2.addWidget(self.radius_spin)
+        lay.addLayout(r2)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+
 class _SatelliteDialog(QDialog):
     def __init__(self, parent=None, info="", epsg=""):
         super().__init__(parent)
@@ -638,7 +689,6 @@ class PointCloudView(QWidget):
     def display(self, points, colors, size=2):
         self._pts, self._colors, self._size = points, colors, size
         self._scatter.set_data(pos=points, face_color=colors, size=size, edge_width=0)
-        self.view.camera.set_range()
         self.canvas.update()
 
     def update_size(self, size):
@@ -764,7 +814,8 @@ class LiDARViewer(QMainWindow):
         self._cloud = None
         self._mask = None
         self._ground_mask = None
-        self._hide_nonground = False
+        self._anomaly_labels = None        # int8: +1 bump, -1 dip, 0 normal
+        self._view_mode = "all"            # "all" | "ground" | "ground_anom"
         self._sat_colors = None
         self._dark_bg = True
         self._filepath = None
@@ -779,6 +830,9 @@ class LiDARViewer(QMainWindow):
         self._z_max = 1000.0
         self._ground_cell = 1.0
         self._ground_ht = 0.3
+        self._anom_cell = 0.5
+        self._anom_thresh = 0.10
+        self._anom_radius = 3.0
         self._epsg_text = ""
         self._crs_display = ""
 
@@ -875,11 +929,36 @@ class LiDARViewer(QMainWindow):
         self._act_ground.triggered.connect(self._dlg_ground)
         pm.addAction(self._act_ground)
 
-        self._act_hide_ng = QAction("Hide Non-Ground Points", self)
-        self._act_hide_ng.setCheckable(True)
-        self._act_hide_ng.setEnabled(False)
-        self._act_hide_ng.toggled.connect(self._toggle_nonground)
-        pm.addAction(self._act_hide_ng)
+        self._act_anomaly = QAction("Detect Ground Anomalies\u2026", self)
+        self._act_anomaly.setEnabled(False)
+        self._act_anomaly.triggered.connect(self._dlg_anomaly)
+        pm.addAction(self._act_anomaly)
+
+        pm.addSeparator()
+
+        self._view_group = QActionGroup(self)
+        self._view_group.setExclusive(True)
+
+        self._act_view_all = QAction("Show All Points", self)
+        self._act_view_all.setCheckable(True)
+        self._act_view_all.setChecked(True)
+        self._act_view_all.triggered.connect(lambda: self._set_view_mode("all"))
+        self._view_group.addAction(self._act_view_all)
+        pm.addAction(self._act_view_all)
+
+        self._act_view_ground = QAction("Show Ground Only", self)
+        self._act_view_ground.setCheckable(True)
+        self._act_view_ground.setEnabled(False)
+        self._act_view_ground.triggered.connect(lambda: self._set_view_mode("ground"))
+        self._view_group.addAction(self._act_view_ground)
+        pm.addAction(self._act_view_ground)
+
+        self._act_view_anom = QAction("Show Ground + Anomalies", self)
+        self._act_view_anom.setCheckable(True)
+        self._act_view_anom.setEnabled(False)
+        self._act_view_anom.triggered.connect(lambda: self._set_view_mode("ground_anom"))
+        self._view_group.addAction(self._act_view_anom)
+        pm.addAction(self._act_view_anom)
 
         pm.addSeparator()
 
@@ -1021,6 +1100,8 @@ class LiDARViewer(QMainWindow):
         self._cloud = data
         self._mask = None
         self._ground_mask = None
+        self._anomaly_labels = None
+        self._view_mode = "all"
         self._sat_colors = None
         self.controls.set_loading(False)
         self.controls.update_file_info(data)
@@ -1058,6 +1139,7 @@ class LiDARViewer(QMainWindow):
 
         self.ground_label.setText("")
         self._render()
+        self.viewer.reset_camera()
         self.status.setText("{:,} / {:,} pts | {:.1f}s".format(
             data["displayed_points"], data["total_points"], data["load_time"],
         ))
@@ -1098,10 +1180,18 @@ class LiDARViewer(QMainWindow):
             colors = np.zeros((len(pts), 4), dtype=np.float32)
             colors[gm] = [0.55, 0.35, 0.17, 1.0]
             colors[~gm] = [0.15, 0.65, 0.15, 1.0]
+
+            if (self._anomaly_labels is not None
+                    and self._view_mode == "ground_anom"):
+                al = self._anomaly_labels
+                if self._mask is not None:
+                    al = al[self._mask]
+                colors[al > 0] = [0.95, 0.55, 0.10, 1.0]   # bump = orange
+                colors[al < 0] = [0.20, 0.40, 0.95, 1.0]   # dip  = blue
         else:
             colors = compute_colors(pts, attrs, mode)
 
-        if self._hide_nonground and self._ground_mask is not None:
+        if self._view_mode in ("ground", "ground_anom") and self._ground_mask is not None:
             gm = self._ground_mask
             if self._mask is not None:
                 gm = gm[self._mask]
@@ -1147,10 +1237,10 @@ class LiDARViewer(QMainWindow):
         self.status.setText("Processing failed")
         QMessageBox.critical(self, "Processing Error", msg)
 
-    # -- ground seg ---------------------------------------------------------
+    # -- ground seg & anomaly -----------------------------------------------
 
-    def _toggle_nonground(self, hide):
-        self._hide_nonground = hide
+    def _set_view_mode(self, mode):
+        self._view_mode = mode
         self._render()
 
     def _run_ground_seg(self, cell_size, height_threshold):
@@ -1191,7 +1281,77 @@ class LiDARViewer(QMainWindow):
             )
         )
 
-        self._act_hide_ng.setEnabled(True)
+        self._act_anomaly.setEnabled(True)
+        self._act_view_ground.setEnabled(True)
+        self._act_view_anom.setEnabled(True)
+        self._add_color_mode("Ground")
+        self.color_combo.setCurrentText("Ground")
+        self._render()
+
+    # -- ground anomaly detection -------------------------------------------
+
+    def _dlg_anomaly(self):
+        if self._ground_mask is None:
+            QMessageBox.information(
+                self, "Ground Required",
+                "Run Ground Segmentation first."
+            )
+            return
+        d = _AnomalyDialog(self, self._anom_cell, self._anom_thresh,
+                            self._anom_radius)
+        if d.exec():
+            self._anom_cell = d.cell_spin.value()
+            self._anom_thresh = d.thresh_spin.value()
+            self._anom_radius = d.radius_spin.value()
+            self._run_anomaly(self._anom_cell, self._anom_thresh,
+                              self._anom_radius)
+
+    def _run_anomaly(self, cell_size, threshold, radius):
+        if not self._cloud:
+            return
+        pts, _ = self._active_data()
+        gm = self._ground_mask
+        if self._mask is not None:
+            gm = gm[self._mask]
+        self.controls.set_loading(True)
+        self.status.setText("Detecting ground anomalies...")
+        self._worker = ProcessingThread(
+            "anomaly", pts,
+            ground_mask=gm, cell_size=cell_size,
+            threshold=threshold, radius=radius,
+        )
+        self._worker.progress.connect(self.status.setText)
+        self._worker.finished.connect(self._on_anomaly_done)
+        self._worker.error.connect(self._on_proc_err)
+        self._worker.start()
+
+    def _on_anomaly_done(self, labels):
+        self.controls.set_loading(False)
+        if self._mask is not None:
+            full = np.zeros(self._cloud["displayed_points"], dtype=np.int8)
+            active_idx = np.where(self._mask)[0]
+            full[active_idx] = labels
+            self._anomaly_labels = full
+        else:
+            self._anomaly_labels = labels
+
+        n_bump = int((labels == 1).sum())
+        n_dip = int((labels == -1).sum())
+        n_g = int(self._ground_mask.sum()) if self._ground_mask is not None else 0
+        self.ground_label.setText(
+            "Ground: {:,} | Bumps: {:,} | Dips: {:,}".format(
+                n_g, n_bump, n_dip
+            )
+        )
+        self.status.setText(
+            "Anomaly detection done \u2014 {:,} bumps + {:,} dips".format(
+                n_bump, n_dip
+            )
+        )
+
+        self._act_view_anom.setEnabled(True)
+        self._view_mode = "ground_anom"
+        self._act_view_anom.setChecked(True)
         self._add_color_mode("Ground")
         self.color_combo.setCurrentText("Ground")
         self._render()
@@ -1250,13 +1410,14 @@ class LiDARViewer(QMainWindow):
     def _reset_proc(self):
         self._mask = None
         self._ground_mask = None
-        self._hide_nonground = False
+        self._anomaly_labels = None
+        self._view_mode = "all"
         self._sat_colors = None
 
-        self._act_hide_ng.blockSignals(True)
-        self._act_hide_ng.setChecked(False)
-        self._act_hide_ng.setEnabled(False)
-        self._act_hide_ng.blockSignals(False)
+        self._act_view_all.setChecked(True)
+        self._act_view_ground.setEnabled(False)
+        self._act_view_anom.setEnabled(False)
+        self._act_anomaly.setEnabled(False)
 
         self.ground_label.setText("")
 
