@@ -11,13 +11,20 @@ def statistical_outlier_removal(points, k=20, std_ratio=2.0, progress_fn=None):
     Points whose mean k-neighbour distance exceeds
     ``mean + std_ratio * std`` are marked as outliers.
     """
+    N = len(points)
     if progress_fn:
-        progress_fn("SOR: KD-tree on {:,} pts...".format(len(points)))
-    tree = cKDTree(points)
-    if progress_fn:
-        progress_fn("SOR: neighbour distances...")
-    d, _ = tree.query(points, k=k + 1)
-    mean_d = d[:, 1:].mean(axis=1)
+        progress_fn("SOR: KD-tree on {:,} pts…".format(N))
+    tree = cKDTree(points, leafsize=32, balanced_tree=False)
+
+    CHUNK = 500_000
+    mean_d = np.empty(N, dtype=np.float64)
+    for start in range(0, N, CHUNK):
+        end = min(start + CHUNK, N)
+        d, _ = tree.query(points[start:end], k=k + 1, workers=-1)
+        mean_d[start:end] = d[:, 1:].mean(axis=1)
+        if progress_fn:
+            progress_fn("SOR: {:,} / {:,} pts…".format(end, N))
+
     return mean_d <= (mean_d.mean() + std_ratio * mean_d.std())
 
 
