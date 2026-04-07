@@ -1,7 +1,7 @@
 """Point-cloud filters: outlier removal, downsampling, ground segmentation."""
 
 import numpy as np
-from scipy.ndimage import minimum_filter, maximum_filter, uniform_filter
+from scipy.ndimage import minimum_filter, maximum_filter, label as ndlabel
 from scipy.spatial import cKDTree, Delaunay
 
 
@@ -45,88 +45,209 @@ def elevation_clip(points, z_min, z_max):
     return (z >= z_min) & (z <= z_max)
 
 
-def detect_ground_anomalies(points, ground_mask, cell_size=0.5,
-                            threshold=0.10, radius=3.0, progress_fn=None):
-    """Detect ground-surface anomalies: bumps (positive) and dips (negative).
+def detect_ground_anomalies(points, ground_mask, reference_spacing=3.0,
+                            threshold=0.05, min_area=0.1, progress_fn=None):
+    """TIN-based slope-corrected ground anomaly detection.
 
-    Builds a smoothed reference ground surface by averaging ground-point
-    elevations over a sliding window of the given *radius*.  Ground points
-    whose elevation deviates from the reference by more than *threshold*
-    are labelled as anomalies.
+    Builds a coarse Delaunay TIN from grid-thinned ground points that follows
+    the terrain slope, then measures per-point signed deviation from the
+    interpolated reference surface.  Connected clusters of anomalous cells are
+    extracted as discrete features with depth/height, area and centroid.
 
     Parameters
     ----------
     points : (N, 3) ndarray
     ground_mask : (N,) bool ndarray
-    cell_size : float – grid resolution for the elevation map.
-    threshold : float – minimum |deviation| to flag as anomaly.
-    radius : float – smoothing radius (metres) for the reference surface.
-        Features smaller than ~2 * radius are treated as anomalies.
+    reference_spacing : float
+        Grid spacing (m) for thinning ground points before TIN construction.
+        Larger values make the reference surface smoother; features smaller
+        than roughly ``reference_spacing`` become detectable.
+    threshold : float
+        Minimum absolute deviation (m) to flag a point as anomalous.
+    min_area : float
+        Minimum cluster area (m^2) to keep a detected feature.
     progress_fn : callable, optional
 
     Returns
     -------
-    labels : (N,) int8 ndarray
-        +1 = positive anomaly (bump / mound / rock),
-        -1 = negative anomaly (pothole / depression),
-         0 = normal ground or non-ground point.
+    dict with keys:
+        ``deviations`` – (N,) float64 signed residual per point (0 for
+        non-ground or points outside the TIN hull).
+        ``features`` – list of dicts, each containing *type* ("bump"/"dip"),
+        *centroid* (x,y,z), *max_dev*, *mean_dev*, *area*, *point_count*,
+        *point_indices*.
     """
+    N = len(points)
+    deviations = np.zeros(N, dtype=np.float64)
     gnd_idx = np.where(ground_mask)[0]
-    if len(gnd_idx) < 10:
-        return np.zeros(len(points), dtype=np.int8)
+    M = len(gnd_idx)
+
+    if M < 10:
+        return {"deviations": deviations, "features": []}
+
+    gnd_xy = points[gnd_idx, :2].astype(np.float64)
+    gnd_z = points[gnd_idx, 2].astype(np.float64)
+
+    # ------------------------------------------------------------------
+    # 1. Grid-thin ground points → coarse reference TIN
+    # ------------------------------------------------------------------
+    if progress_fn:
+        progress_fn("Anomaly: grid-thinning for reference TIN...")
+
+    thin_idx = _grid_thin(gnd_xy, np.arange(M),
+                          max_pts=50000, cell_hint=reference_spacing)
+    thin_xy = gnd_xy[thin_idx]
+    thin_z = gnd_z[thin_idx]
+
+    if len(thin_idx) < 3:
+        return {"deviations": deviations, "features": []}
+
+    # ------------------------------------------------------------------
+    # 2. Build Delaunay TIN
+    # ------------------------------------------------------------------
+    if progress_fn:
+        progress_fn("Anomaly: building reference TIN ({:,} pts)...".format(
+            len(thin_idx)))
+
+    try:
+        tri = Delaunay(thin_xy)
+    except Exception:
+        return {"deviations": deviations, "features": []}
+
+    # ------------------------------------------------------------------
+    # 3. Barycentric interpolation – spatially sorted for fast walk
+    # ------------------------------------------------------------------
+    if progress_fn:
+        progress_fn("Anomaly: interpolating {:,} ground pts...".format(M))
+
+    x_min, y_min = float(gnd_xy[:, 0].min()), float(gnd_xy[:, 1].min())
+    x_max, y_max = float(gnd_xy[:, 0].max()), float(gnd_xy[:, 1].max())
+    sort_cell = max(reference_spacing, 5.0)
+    sny = max(1, int(np.ceil((y_max - y_min) / sort_cell)) + 1)
+    sort_key = (np.floor((gnd_xy[:, 0] - x_min) / sort_cell).astype(np.int64)
+                * sny
+                + np.floor((gnd_xy[:, 1] - y_min) / sort_cell).astype(np.int64))
+    sort_order = np.argsort(sort_key, kind="mergesort")
+    unsort = np.empty_like(sort_order)
+    unsort[sort_order] = np.arange(M)
+
+    sorted_xy = gnd_xy[sort_order]
+    simp = tri.find_simplex(sorted_xy)
+    simp = simp[unsort]
+
+    inside_idx = np.where(simp >= 0)[0]
+    if len(inside_idx) == 0:
+        return {"deviations": deviations, "features": []}
+
+    s = simp[inside_idx]
+    T = tri.transform[s, :2, :]
+    r = tri.transform[s, 2, :]
+    b = np.einsum("mij,mj->mi", T, gnd_xy[inside_idx] - r)
+    w = 1.0 - b.sum(axis=1)
+    verts = tri.simplices[s]
+    ref_z = (b[:, 0] * thin_z[verts[:, 0]]
+             + b[:, 1] * thin_z[verts[:, 1]]
+             + w * thin_z[verts[:, 2]])
+
+    dev = gnd_z[inside_idx] - ref_z
+    deviations[gnd_idx[inside_idx]] = dev
 
     if progress_fn:
-        progress_fn("Anomaly: building elevation grid...")
+        progress_fn("Anomaly: clustering features...")
 
-    xy = points[gnd_idx, :2].astype(np.float64)
-    z = points[gnd_idx, 2].astype(np.float64)
+    # ------------------------------------------------------------------
+    # 4. Feature clustering – fully vectorized
+    # ------------------------------------------------------------------
+    fine_cs = max(reference_spacing / 10.0, 0.10)
+    mn = gnd_xy.min(axis=0)
+    span = gnd_xy.max(axis=0) - mn
+    fnx = max(int(np.ceil(span[0] / fine_cs)), 1)
+    fny = max(int(np.ceil(span[1] / fine_cs)), 1)
 
-    mn = xy.min(axis=0)
-    span = xy.max(axis=0) - mn
-    cs = max(float(cell_size), 0.01)
-    nx = max(int(np.ceil(span[0] / cs)), 1)
-    ny = max(int(np.ceil(span[1] / cs)), 1)
+    gi = np.clip(((gnd_xy[inside_idx, 0] - mn[0]) / fine_cs).astype(np.int32),
+                 0, fnx - 1)
+    gj = np.clip(((gnd_xy[inside_idx, 1] - mn[1]) / fine_cs).astype(np.int32),
+                 0, fny - 1)
 
-    gi = np.clip(((xy[:, 0] - mn[0]) / cs).astype(np.int32), 0, nx - 1)
-    gj = np.clip(((xy[:, 1] - mn[1]) / cs).astype(np.int32), 0, ny - 1)
-
-    # Mean Z per cell
-    grid_sum = np.zeros((ny, nx), dtype=np.float64)
-    grid_cnt = np.zeros((ny, nx), dtype=np.float64)
-    np.add.at(grid_sum, (gj, gi), z)
+    grid_sum = np.zeros((fny, fnx), dtype=np.float64)
+    grid_cnt = np.zeros((fny, fnx), dtype=np.float64)
+    np.add.at(grid_sum, (gj, gi), dev)
     np.add.at(grid_cnt, (gj, gi), 1.0)
-
     has_data = grid_cnt > 0
-    grid_z = np.where(has_data, grid_sum / np.maximum(grid_cnt, 1), 0.0)
-    data_flag = has_data.astype(np.float64)
+    grid_dev = np.where(has_data, grid_sum / np.maximum(grid_cnt, 1), 0.0)
 
-    # NaN-safe moving average: filter sum and count separately, then divide
-    win = max(3, int(np.ceil(2.0 * radius / cs)) | 1)
+    # Mean-Z grid (reuse the cnt already computed)
+    gz_sum = np.zeros((fny, fnx), dtype=np.float64)
+    np.add.at(gz_sum, (gj, gi), gnd_z[inside_idx])
+    gz_mean = np.where(has_data, gz_sum / np.maximum(grid_cnt, 1), 0.0)
+
+    struct = np.ones((3, 3), dtype=np.int32)
+    cell_area = fine_cs * fine_cs
+    min_cells = max(int(np.ceil(min_area / cell_area)), 1)
+
+    # Build a single combined label grid: positive IDs = bumps, negative = dips
+    combined = np.zeros((fny, fnx), dtype=np.int32)
+    bump_grid = grid_dev > threshold
+    dip_grid = grid_dev < -threshold
+
+    bump_labels, n_bumps = ndlabel(bump_grid, structure=struct)
+    if n_bumps:
+        combined[bump_grid] = bump_labels[bump_grid]
+
+    dip_labels, n_dips = ndlabel(dip_grid, structure=struct)
+    if n_dips:
+        combined[dip_grid] = -(dip_labels[dip_grid])
+
+    # Look up per-point label in O(M) — no Python loop
+    pt_label = combined[gj, gi]
+
+    features = []
+
+    def _extract(label_ids, sign_name, kind):
+        for fid in label_ids:
+            if kind == 1:
+                grid_mask = bump_labels == fid
+            else:
+                grid_mask = dip_labels == fid
+
+            n_cells = int(grid_mask.sum())
+            if n_cells < min_cells:
+                continue
+
+            cj_f, ci_f = np.where(grid_mask)
+            cell_devs = grid_dev[cj_f, ci_f]
+            area = float(n_cells) * cell_area
+
+            cx = mn[0] + (ci_f + 0.5) * fine_cs
+            cy = mn[1] + (cj_f + 0.5) * fine_cs
+            c_gz = gz_mean[cj_f, ci_f]
+            valid_gz = c_gz[grid_cnt[cj_f, ci_f] > 0]
+
+            tag = fid if kind == 1 else -fid
+            pt_indices = gnd_idx[inside_idx[pt_label == tag]]
+
+            features.append({
+                "type": sign_name,
+                "centroid": (float(cx.mean()), float(cy.mean()),
+                             float(valid_gz.mean()) if len(valid_gz) else 0.0),
+                "max_dev": float(cell_devs.max()) if kind == 1 else float(cell_devs.min()),
+                "mean_dev": float(cell_devs.mean()),
+                "area": area,
+                "point_count": len(pt_indices),
+                "point_indices": pt_indices,
+            })
+
+    if n_bumps:
+        _extract(range(1, n_bumps + 1), "bump", 1)
+    if n_dips:
+        _extract(range(1, n_dips + 1), "dip", -1)
+
     if progress_fn:
-        progress_fn("Anomaly: smoothing reference ({} cell window)...".format(win))
+        nb = sum(1 for f in features if f["type"] == "bump")
+        nd = sum(1 for f in features if f["type"] == "dip")
+        progress_fn("Anomaly: {:,} bumps + {:,} dips detected".format(nb, nd))
 
-    smooth_sum = uniform_filter(grid_z, size=win, mode="constant", cval=0.0)
-    smooth_cnt = uniform_filter(data_flag, size=win, mode="constant", cval=0.0)
-    ref = np.where(smooth_cnt > 0, smooth_sum / smooth_cnt, np.nan)
-
-    if progress_fn:
-        progress_fn("Anomaly: classifying {:,} ground points...".format(len(gnd_idx)))
-
-    ref_z = ref[gj, gi]
-    valid = np.isfinite(ref_z)
-    deviation = z - ref_z
-
-    labels = np.zeros(len(points), dtype=np.int8)
-    labels[gnd_idx[valid & (deviation > threshold)]] = 1     # bump
-    labels[gnd_idx[valid & (deviation < -threshold)]] = -1   # dip
-
-    if progress_fn:
-        n_bump = int((labels == 1).sum())
-        n_dip = int((labels == -1).sum())
-        progress_fn("Found {:,} bumps + {:,} dips in {:,} ground".format(
-            n_bump, n_dip, len(gnd_idx)))
-
-    return labels
+    return {"deviations": deviations, "features": features}
 
 
 # ---------------------------------------------------------------------------

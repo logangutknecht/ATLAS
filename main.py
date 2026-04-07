@@ -58,6 +58,10 @@ TURBO_COLORS = [
 ]
 TURBO_CMAP = Colormap(TURBO_COLORS, interpolation="linear")
 
+DEV_COLOR_GROUND = (0.90, 0.55, 0.10, 1.0)   # orange  – normal ground
+DEV_COLOR_DIP    = (0.55, 0.20, 0.70, 1.0)   # purple  – negative obstacle
+DEV_COLOR_BUMP   = (0.95, 0.85, 0.45, 1.0)   # yellow  – positive obstacle
+
 ASPRS_COLORS = {
     0: (0.50, 0.50, 0.50, 1.0),  1: (0.60, 0.60, 0.60, 1.0),
     2: (0.65, 0.45, 0.20, 1.0),  3: (0.45, 0.75, 0.30, 1.0),
@@ -270,7 +274,7 @@ class LASLoaderThread(QThread):
 
 class ProcessingThread(QThread):
     """Dispatches to ProcessingTechniques.filters functions."""
-    finished = pyqtSignal(np.ndarray)
+    finished = pyqtSignal(object)
     error = pyqtSignal(str)
     progress = pyqtSignal(str)
 
@@ -284,20 +288,21 @@ class ProcessingThread(QThread):
         try:
             pfn = self.progress.emit
             if self.op == "sor":
-                mask = statistical_outlier_removal(self.pts, self.kw["k"], self.kw["std_ratio"], pfn)
+                result = statistical_outlier_removal(self.pts, self.kw["k"], self.kw["std_ratio"], pfn)
             elif self.op == "voxel":
-                mask = voxel_downsample(self.pts, self.kw["voxel_size"], pfn)
+                result = voxel_downsample(self.pts, self.kw["voxel_size"], pfn)
             elif self.op == "elevation":
-                mask = elevation_clip(self.pts, self.kw["z_min"], self.kw["z_max"])
+                result = elevation_clip(self.pts, self.kw["z_min"], self.kw["z_max"])
             elif self.op == "ground":
-                mask = ground_segmentation(self.pts, self.kw["cell_size"], self.kw["height_threshold"], pfn)
+                result = ground_segmentation(self.pts, self.kw["cell_size"], self.kw["height_threshold"], pfn)
             elif self.op == "anomaly":
-                mask = detect_ground_anomalies(
-                    self.pts, self.kw["ground_mask"], self.kw["cell_size"],
-                    self.kw["threshold"], self.kw["radius"], pfn)
+                result = detect_ground_anomalies(
+                    self.pts, self.kw["ground_mask"],
+                    self.kw["reference_spacing"], self.kw["threshold"],
+                    self.kw["min_area"], pfn)
             else:
                 raise ValueError("Unknown op: " + self.op)
-            self.finished.emit(mask)
+            self.finished.emit(result)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -490,42 +495,44 @@ class _GroundSegDialog(QDialog):
 
 
 class _AnomalyDialog(QDialog):
-    def __init__(self, parent=None, cell=0.5, threshold=0.10, radius=3.0):
+    def __init__(self, parent=None, spacing=3.0, threshold=0.05, min_area=0.1):
         super().__init__(parent)
         self.setWindowTitle("Detect Ground Anomalies")
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel(
-            "Detects bumps (rocks, mounds) and dips (potholes, craters)\n"
-            "by comparing ground points to a smoothed reference surface."
+            "TIN-based slope-corrected anomaly detection.\n"
+            "Detects bumps and dips relative to a coarse reference surface."
         ))
         r1 = QHBoxLayout()
-        r1.addWidget(QLabel("Cell size:"))
-        self.cell_spin = QDoubleSpinBox()
-        self.cell_spin.setRange(0.05, 20.0)
-        self.cell_spin.setValue(cell)
-        self.cell_spin.setSingleStep(0.1)
-        self.cell_spin.setDecimals(2)
-        r1.addWidget(self.cell_spin)
-        r1.addWidget(QLabel("Threshold:"))
-        self.thresh_spin = QDoubleSpinBox()
-        self.thresh_spin.setRange(0.01, 50.0)
-        self.thresh_spin.setValue(threshold)
-        self.thresh_spin.setSingleStep(0.01)
-        self.thresh_spin.setDecimals(2)
-        self.thresh_spin.setToolTip("Minimum deviation from the reference surface")
-        r1.addWidget(self.thresh_spin)
+        r1.addWidget(QLabel("Reference spacing (m):"))
+        self.spacing_spin = QDoubleSpinBox()
+        self.spacing_spin.setRange(0.5, 50.0)
+        self.spacing_spin.setValue(spacing)
+        self.spacing_spin.setSingleStep(0.5)
+        self.spacing_spin.setDecimals(1)
+        self.spacing_spin.setToolTip(
+            "Grid spacing for the coarse reference TIN. Features smaller "
+            "than this are detectable."
+        )
+        r1.addWidget(self.spacing_spin)
         lay.addLayout(r1)
         r2 = QHBoxLayout()
-        r2.addWidget(QLabel("Smoothing radius:"))
-        self.radius_spin = QDoubleSpinBox()
-        self.radius_spin.setRange(0.5, 100.0)
-        self.radius_spin.setValue(radius)
-        self.radius_spin.setSingleStep(0.5)
-        self.radius_spin.setDecimals(1)
-        self.radius_spin.setToolTip(
-            "Features smaller than ~2x this radius are flagged as anomalies"
-        )
-        r2.addWidget(self.radius_spin)
+        r2.addWidget(QLabel("Threshold (m):"))
+        self.thresh_spin = QDoubleSpinBox()
+        self.thresh_spin.setRange(0.005, 50.0)
+        self.thresh_spin.setValue(threshold)
+        self.thresh_spin.setSingleStep(0.01)
+        self.thresh_spin.setDecimals(3)
+        self.thresh_spin.setToolTip("Minimum |deviation| to flag as anomaly")
+        r2.addWidget(self.thresh_spin)
+        r2.addWidget(QLabel("Min area (m\u00b2):"))
+        self.area_spin = QDoubleSpinBox()
+        self.area_spin.setRange(0.01, 1000.0)
+        self.area_spin.setValue(min_area)
+        self.area_spin.setSingleStep(0.1)
+        self.area_spin.setDecimals(2)
+        self.area_spin.setToolTip("Minimum cluster area to report as a feature")
+        r2.addWidget(self.area_spin)
         lay.addLayout(r2)
         bb = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -814,7 +821,8 @@ class LiDARViewer(QMainWindow):
         self._cloud = None
         self._mask = None
         self._ground_mask = None
-        self._anomaly_labels = None        # int8: +1 bump, -1 dip, 0 normal
+        self._deviations = None            # float64 signed residual per point
+        self._features = None              # list of feature dicts
         self._view_mode = "all"            # "all" | "ground" | "ground_anom"
         self._sat_colors = None
         self._dark_bg = True
@@ -830,9 +838,9 @@ class LiDARViewer(QMainWindow):
         self._z_max = 1000.0
         self._ground_cell = 1.0
         self._ground_ht = 0.3
-        self._anom_cell = 0.5
-        self._anom_thresh = 0.10
-        self._anom_radius = 3.0
+        self._anom_spacing = 3.0
+        self._anom_thresh = 0.05
+        self._anom_min_area = 0.1
         self._epsg_text = ""
         self._crs_display = ""
 
@@ -1100,7 +1108,8 @@ class LiDARViewer(QMainWindow):
         self._cloud = data
         self._mask = None
         self._ground_mask = None
-        self._anomaly_labels = None
+        self._deviations = None
+        self._features = None
         self._view_mode = "all"
         self._sat_colors = None
         self.controls.set_loading(False)
@@ -1173,6 +1182,14 @@ class LiDARViewer(QMainWindow):
             colors = self._sat_colors
             if self._mask is not None:
                 colors = colors[self._mask]
+        elif mode == "Deviation" and self._deviations is not None:
+            dev = self._deviations
+            if self._mask is not None:
+                dev = dev[self._mask]
+            colors = np.tile(np.array(DEV_COLOR_GROUND, dtype=np.float32),
+                             (len(pts), 1))
+            colors[dev < 0] = DEV_COLOR_DIP
+            colors[dev > 0] = DEV_COLOR_BUMP
         elif mode == "Ground" and self._ground_mask is not None:
             gm = self._ground_mask
             if self._mask is not None:
@@ -1180,14 +1197,6 @@ class LiDARViewer(QMainWindow):
             colors = np.zeros((len(pts), 4), dtype=np.float32)
             colors[gm] = [0.55, 0.35, 0.17, 1.0]
             colors[~gm] = [0.15, 0.65, 0.15, 1.0]
-
-            if (self._anomaly_labels is not None
-                    and self._view_mode == "ground_anom"):
-                al = self._anomaly_labels
-                if self._mask is not None:
-                    al = al[self._mask]
-                colors[al > 0] = [0.95, 0.55, 0.10, 1.0]   # bump = orange
-                colors[al < 0] = [0.20, 0.40, 0.95, 1.0]   # dip  = blue
         else:
             colors = compute_colors(pts, attrs, mode)
 
@@ -1297,16 +1306,16 @@ class LiDARViewer(QMainWindow):
                 "Run Ground Segmentation first."
             )
             return
-        d = _AnomalyDialog(self, self._anom_cell, self._anom_thresh,
-                            self._anom_radius)
+        d = _AnomalyDialog(self, self._anom_spacing, self._anom_thresh,
+                            self._anom_min_area)
         if d.exec():
-            self._anom_cell = d.cell_spin.value()
+            self._anom_spacing = d.spacing_spin.value()
             self._anom_thresh = d.thresh_spin.value()
-            self._anom_radius = d.radius_spin.value()
-            self._run_anomaly(self._anom_cell, self._anom_thresh,
-                              self._anom_radius)
+            self._anom_min_area = d.area_spin.value()
+            self._run_anomaly(self._anom_spacing, self._anom_thresh,
+                              self._anom_min_area)
 
-    def _run_anomaly(self, cell_size, threshold, radius):
+    def _run_anomaly(self, reference_spacing, threshold, min_area):
         if not self._cloud:
             return
         pts, _ = self._active_data()
@@ -1317,43 +1326,55 @@ class LiDARViewer(QMainWindow):
         self.status.setText("Detecting ground anomalies...")
         self._worker = ProcessingThread(
             "anomaly", pts,
-            ground_mask=gm, cell_size=cell_size,
-            threshold=threshold, radius=radius,
+            ground_mask=gm, reference_spacing=reference_spacing,
+            threshold=threshold, min_area=min_area,
         )
         self._worker.progress.connect(self.status.setText)
         self._worker.finished.connect(self._on_anomaly_done)
         self._worker.error.connect(self._on_proc_err)
         self._worker.start()
 
-    def _on_anomaly_done(self, labels):
+    def _on_anomaly_done(self, result):
         self.controls.set_loading(False)
-        if self._mask is not None:
-            full = np.zeros(self._cloud["displayed_points"], dtype=np.int8)
-            active_idx = np.where(self._mask)[0]
-            full[active_idx] = labels
-            self._anomaly_labels = full
-        else:
-            self._anomaly_labels = labels
+        devs = result["deviations"]
+        feats = result["features"]
 
-        n_bump = int((labels == 1).sum())
-        n_dip = int((labels == -1).sum())
+        if self._mask is not None:
+            full = np.zeros(self._cloud["displayed_points"], dtype=np.float64)
+            active_idx = np.where(self._mask)[0]
+            full[active_idx] = devs
+            self._deviations = full
+        else:
+            self._deviations = devs
+        self._features = feats
+
+        n_bumps = sum(1 for f in feats if f["type"] == "bump")
+        n_dips = sum(1 for f in feats if f["type"] == "dip")
         n_g = int(self._ground_mask.sum()) if self._ground_mask is not None else 0
-        self.ground_label.setText(
-            "Ground: {:,} | Bumps: {:,} | Dips: {:,}".format(
-                n_g, n_bump, n_dip
-            )
-        )
+
+        parts = ["Ground: {:,}".format(n_g)]
+        if n_bumps:
+            biggest_bump = max((f for f in feats if f["type"] == "bump"),
+                               key=lambda f: abs(f["max_dev"]))
+            parts.append("{:,} bumps (max {:.0f}cm, {:.1f}m\u00b2)".format(
+                n_bumps, abs(biggest_bump["max_dev"]) * 100,
+                biggest_bump["area"]))
+        if n_dips:
+            biggest_dip = max((f for f in feats if f["type"] == "dip"),
+                              key=lambda f: abs(f["max_dev"]))
+            parts.append("{:,} dips (max {:.0f}cm, {:.1f}m\u00b2)".format(
+                n_dips, abs(biggest_dip["max_dev"]) * 100,
+                biggest_dip["area"]))
+        self.ground_label.setText(" | ".join(parts))
         self.status.setText(
             "Anomaly detection done \u2014 {:,} bumps + {:,} dips".format(
-                n_bump, n_dip
-            )
-        )
+                n_bumps, n_dips))
 
         self._act_view_anom.setEnabled(True)
         self._view_mode = "ground_anom"
         self._act_view_anom.setChecked(True)
-        self._add_color_mode("Ground")
-        self.color_combo.setCurrentText("Ground")
+        self._add_color_mode("Deviation")
+        self.color_combo.setCurrentText("Deviation")
         self._render()
 
     # -- satellite texture --------------------------------------------------
@@ -1410,7 +1431,8 @@ class LiDARViewer(QMainWindow):
     def _reset_proc(self):
         self._mask = None
         self._ground_mask = None
-        self._anomaly_labels = None
+        self._deviations = None
+        self._features = None
         self._view_mode = "all"
         self._sat_colors = None
 
