@@ -182,3 +182,4 @@ cython_debug/
 *.las
 /LiDAR_LAS
 .DS_Store
+/CAMERA

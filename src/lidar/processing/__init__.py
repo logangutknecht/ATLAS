@@ -1,11 +1,4 @@
-"""ProcessingTechniques – LiDAR post-processing algorithms.
-
-Submodules
-----------
-geo        – CRS detection, coordinate reprojection
-filters    – Point-cloud filters (SOR, voxel, elevation, ground seg)
-satellite  – Satellite imagery fetching & point-cloud colorization
-"""
+"""LiDAR processing algorithms: filtering, segmentation, geo utilities, satellite imagery."""
 
 from .geo import (
     extract_crs_wkt,
@@ -20,6 +13,7 @@ from .filters import (
     voxel_downsample,
     elevation_clip,
     ground_segmentation,
+    detect_ground_anomalies,
 )
 
 from .satellite import (
