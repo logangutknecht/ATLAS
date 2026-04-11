@@ -181,3 +181,4 @@ cython_debug/
 .cursorindexingignore
 *.las
 /LiDAR_LAS
+.DS_Store
