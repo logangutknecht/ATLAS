@@ -1,9 +1,10 @@
-"""Background workers for photogrammetry image loading."""
+"""Background workers for photogrammetry image loading and processing."""
 
 import os
 
+import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
-from PyQt6.QtGui import QPixmap, QImage
+from PyQt6.QtGui import QPixmap
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 THUMB_SIZE = (120, 90)
@@ -13,9 +14,9 @@ class ImageLoaderThread(QThread):
     """Scans a directory for images, loads thumbnails, and emits them one by one."""
 
     thumbnail_ready = pyqtSignal(str, QPixmap)   # (path, thumbnail pixmap)
-    finished = pyqtSignal(list)                  # list of all image paths
-    progress = pyqtSignal(str)
-    error = pyqtSignal(str)
+    finished        = pyqtSignal(list)            # list of all image paths
+    progress        = pyqtSignal(str)
+    error           = pyqtSignal(str)
 
     def __init__(self, directory):
         super().__init__()
@@ -49,3 +50,57 @@ class ImageLoaderThread(QThread):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
+
+
+class MetadataLoaderThread(QThread):
+    """Parses EXIF/XMP metadata from every image in a list."""
+
+    finished = pyqtSignal(list)    # list of metadata dicts
+    progress = pyqtSignal(str, int, int)  # message, current, total
+    error    = pyqtSignal(str)
+
+    def __init__(self, paths: list):
+        super().__init__()
+        self.paths = paths
+
+    def run(self):
+        from src.photogrammetry.processing.metadata import parse_image_metadata
+        results = []
+        total = len(self.paths)
+        for i, path in enumerate(self.paths):
+            self.progress.emit(
+                "Reading metadata {}/{}…".format(i + 1, total), i + 1, total
+            )
+            try:
+                results.append(parse_image_metadata(path))
+            except Exception:
+                pass
+        self.finished.emit(results)
+
+
+class OrthoThread(QThread):
+    """Builds an orthomosaic from pre-loaded image metadata."""
+
+    finished = pyqtSignal(object, dict)   # (PIL.Image, info_dict)
+    progress = pyqtSignal(str, int, int)  # message, current, total
+    error    = pyqtSignal(str)
+
+    def __init__(self, all_metadata: list, config):
+        super().__init__()
+        self.all_metadata = all_metadata
+        self.config       = config
+
+    def run(self):
+        from src.photogrammetry.processing.ortho import build_orthomosaic
+        try:
+            def _pfn(msg, cur, tot):
+                self.progress.emit(msg, cur, tot)
+
+            image, info = build_orthomosaic(
+                self.all_metadata,
+                self.config,
+                progress_fn=_pfn,
+            )
+            self.finished.emit(image, info)
+        except Exception as exc:
+            self.error.emit(str(exc))
