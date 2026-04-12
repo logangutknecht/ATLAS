@@ -3,9 +3,10 @@
 ThumbnailGrid   – scrollable, clickable thumbnail strip
 ImageViewer     – full-resolution single-image display (fit to window)
 FlightMapView   – 2-D overhead map of camera positions and footprints
-OrthoView       – orthomosaic result display (reuses ImageViewer logic)
+OrthoViewer     – interactive ortho display with zoom, pan, overlays
 """
 
+import math
 import os
 
 import numpy as np
@@ -17,7 +18,10 @@ from PyQt6.QtWidgets import (
     QTabBar, QApplication,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QRectF, QPointF, QTimer
-from PyQt6.QtGui import QPixmap, QIcon, QFont, QColor, QPen, QBrush, QPolygonF
+from PyQt6.QtGui import (
+    QPixmap, QIcon, QFont, QColor, QPen, QBrush, QPolygonF,
+    QPainter, QPainterPath,
+)
 
 
 _THUMB_BTN_STYLE = (
@@ -363,6 +367,319 @@ class FlightMapView(QGraphicsView):
 
 
 # ---------------------------------------------------------------------------
+# Nice scale values for the ortho scale bar
+# ---------------------------------------------------------------------------
+
+_SCALE_NICES = [
+    0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50,
+    100, 200, 500, 1000, 2000, 5000, 10000,
+]
+
+
+# ---------------------------------------------------------------------------
+# Interactive ortho viewer with zoom, pan, lat/lon cursor, compass, scale bar
+# ---------------------------------------------------------------------------
+
+class OrthoViewer(QWidget):
+    """Zoomable, pannable orthomosaic viewer with map overlays."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: #1a1a2e;")
+        self.setMouseTracking(True)
+
+        self._pixmap = None
+        self._title_text = ""
+        self._dim_text = ""
+
+        # Geo-referencing info (set via set_geo)
+        self._origin = None      # (lat, lon, alt)
+        self._bounds = None      # (xmin, xmax, ymin, ymax) in ENU metres
+        self._resolution = None  # m/px
+
+        # View transform state
+        self._zoom = 1.0
+        self._pan = QPointF(0, 0)   # pixel offset in widget coords
+        self._dragging = False
+        self._drag_start = QPointF()
+        self._pan_start = QPointF()
+
+        # Cursor coordinate label (floating over the viewport)
+        self._coord_label = QLabel(self)
+        self._coord_label.setStyleSheet(
+            "background: rgba(0,0,0,170); color: #ddd; font-size: 11px;"
+            " padding: 2px 6px; border-radius: 3px;"
+        )
+        self._coord_label.hide()
+
+    # -- public API ---------------------------------------------------------
+
+    def show_pixmap(self, pixmap, label="Orthomosaic"):
+        self._pixmap = pixmap
+        self._title_text = label
+        self._dim_text = "{} × {}".format(pixmap.width(), pixmap.height())
+        self._zoom = 1.0
+        self._pan = QPointF(0, 0)
+        self.update()
+
+    def set_geo(self, origin, bounds, resolution):
+        """Store georeferencing info for coordinate display.
+
+        origin     – (lat, lon, alt) ENU origin in WGS84
+        bounds     – (xmin, xmax, ymin, ymax) in ENU metres
+        resolution – metres per ortho pixel
+        """
+        self._origin = origin
+        self._bounds = bounds
+        self._resolution = resolution
+
+    # -- coordinate helpers -------------------------------------------------
+
+    def _widget_to_enu(self, widget_pos):
+        """Convert a widget-space position to ENU (east, north) or None."""
+        if self._pixmap is None or self._bounds is None:
+            return None
+        img_rect = self._image_rect()
+        if img_rect is None or img_rect.width() == 0 or img_rect.height() == 0:
+            return None
+
+        fx = (widget_pos.x() - img_rect.x()) / img_rect.width()
+        fy = (widget_pos.y() - img_rect.y()) / img_rect.height()
+        if not (0 <= fx <= 1 and 0 <= fy <= 1):
+            return None
+
+        xmin, xmax, ymin, ymax = self._bounds
+        east = xmin + fx * (xmax - xmin)
+        north = ymax - fy * (ymax - ymin)
+        return east, north
+
+    def _enu_to_latlon(self, east, north):
+        """Convert local ENU offset back to approximate WGS84 lat/lon.
+
+        The ortho builder negates E/N positions before computing bounds,
+        so we invert them here to recover true geographic coordinates.
+        """
+        if self._origin is None:
+            return None
+        lat0, lon0, _alt0 = self._origin
+        lat = lat0 + (-north) / 111_320.0
+        lon = lon0 + (-east) / (111_320.0 * math.cos(math.radians(lat0)))
+        return lat, lon
+
+    # -- image layout -------------------------------------------------------
+
+    def _image_rect(self):
+        """Return QRectF of the ortho image in widget coordinates."""
+        if self._pixmap is None:
+            return None
+        pw, ph = self._pixmap.width(), self._pixmap.height()
+        vw = self.width()
+        vh = self.height() - 28  # subtract header
+        if pw == 0 or ph == 0 or vw == 0 or vh == 0:
+            return None
+
+        # Fit scale (before zoom)
+        fit = min(vw / pw, vh / ph)
+        w = pw * fit * self._zoom
+        h = ph * fit * self._zoom
+        x = (vw - w) / 2.0 + self._pan.x()
+        y = 28 + (vh - h) / 2.0 + self._pan.y()
+        return QRectF(x, y, w, h)
+
+    # -- painting -----------------------------------------------------------
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor("#1a1a2e"))
+
+        # Header
+        p.fillRect(0, 0, self.width(), 28, QColor("#252525"))
+        p.setPen(QColor("#999"))
+        p.setFont(QFont("Segoe UI", 9))
+        p.drawText(8, 18, self._title_text)
+        p.setPen(QColor("#666"))
+        tw = p.fontMetrics().horizontalAdvance(self._dim_text)
+        p.drawText(self.width() - tw - 8, 18, self._dim_text)
+
+        if self._pixmap is None:
+            p.setPen(QColor("#555"))
+            p.setFont(QFont("Segoe UI", 14))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No orthomosaic")
+            p.end()
+            return
+
+        rect = self._image_rect()
+        if rect is not None:
+            p.drawPixmap(rect.toRect(), self._pixmap)
+
+        self._draw_compass(p)
+        self._draw_scale_bar(p)
+        p.end()
+
+    def _draw_compass(self, p):
+        """Draw a cardinal-direction compass rose in the bottom-right corner."""
+        cx = self.width() - 40
+        cy = self.height() - 50
+        r = 22
+
+        # Circle background
+        p.setBrush(QBrush(QColor(30, 30, 30, 180)))
+        p.setPen(QPen(QColor(100, 100, 100), 1))
+        p.drawEllipse(QPointF(cx, cy), r + 6, r + 6)
+
+        font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+        p.setFont(font)
+
+        directions = [
+            ("N", 0, QColor(220, 60, 60)),
+            ("E", 90, QColor(200, 200, 200)),
+            ("S", 180, QColor(200, 200, 200)),
+            ("W", 270, QColor(200, 200, 200)),
+        ]
+        for label, angle_deg, color in directions:
+            rad = math.radians(angle_deg - 90)
+            tx = cx + (r + 1) * math.cos(rad)
+            ty = cy + (r + 1) * math.sin(rad)
+            p.setPen(color)
+            fm = p.fontMetrics()
+            tw = fm.horizontalAdvance(label)
+            th = fm.height()
+            p.drawText(int(tx - tw / 2), int(ty + th / 3), label)
+
+        # Needle
+        p.setPen(Qt.PenStyle.NoPen)
+        # North (red) half
+        north_path = QPainterPath()
+        north_path.moveTo(cx, cy - r + 4)
+        north_path.lineTo(cx - 3, cy)
+        north_path.lineTo(cx + 3, cy)
+        north_path.closeSubpath()
+        p.setBrush(QBrush(QColor(220, 60, 60)))
+        p.drawPath(north_path)
+        # South (white) half
+        south_path = QPainterPath()
+        south_path.moveTo(cx, cy + r - 4)
+        south_path.lineTo(cx - 3, cy)
+        south_path.lineTo(cx + 3, cy)
+        south_path.closeSubpath()
+        p.setBrush(QBrush(QColor(200, 200, 200)))
+        p.drawPath(south_path)
+
+    def _draw_scale_bar(self, p):
+        """Draw a distance scale bar in the bottom-left corner."""
+        if self._resolution is None or self._pixmap is None:
+            return
+        rect = self._image_rect()
+        if rect is None or rect.width() == 0:
+            return
+
+        pw = self._pixmap.width()
+        m_per_widget_px = (pw * self._resolution) / rect.width()
+
+        target = m_per_widget_px * 140
+        bar_m = min(_SCALE_NICES, key=lambda v: abs(v - target))
+        bar_px = max(20, min(int(bar_m / max(m_per_widget_px, 1e-12)), 180))
+
+        if bar_m >= 1:
+            text = "{:g} m".format(bar_m)
+        else:
+            text = "{:g} cm".format(bar_m * 100)
+
+        x0 = 14
+        y = self.height() - 16
+        x1 = x0 + bar_px
+
+        # Background
+        p.setBrush(QBrush(QColor(0, 0, 0, 140)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(QRectF(x0 - 6, y - 22, bar_px + 12, 30), 4, 4)
+
+        pen = QPen(QColor(200, 200, 200))
+        pen.setWidth(2)
+        p.setPen(pen)
+        p.drawLine(x0, y, x1, y)
+        p.drawLine(x0, y - 5, x0, y + 5)
+        p.drawLine(x1, y - 5, x1, y + 5)
+
+        p.setFont(QFont("Segoe UI", 9))
+        p.drawText(x0, y - 8, text)
+
+    # -- input events -------------------------------------------------------
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        factor = 1.15 if delta > 0 else 1 / 1.15
+
+        old_zoom = self._zoom
+        self._zoom = max(0.1, min(self._zoom * factor, 50.0))
+        actual_factor = self._zoom / old_zoom
+
+        # Zoom towards cursor
+        mouse = event.position()
+        cx = self.width() / 2.0 + self._pan.x()
+        cy = (self.height() - 28) / 2.0 + 28 + self._pan.y()
+        self._pan.setX(self._pan.x() - (mouse.x() - cx) * (actual_factor - 1))
+        self._pan.setY(self._pan.y() - (mouse.y() - cy) * (actual_factor - 1))
+
+        self.update()
+        self._update_coord_label(event.position())
+
+    def mousePressEvent(self, event):
+        if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton):
+            self._dragging = True
+            self._drag_start = event.position()
+            self._pan_start = QPointF(self._pan)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            delta = event.position() - self._drag_start
+            self._pan = QPointF(
+                self._pan_start.x() + delta.x(),
+                self._pan_start.y() + delta.y(),
+            )
+            self.update()
+        self._update_coord_label(event.position())
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging:
+            self._dragging = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def leaveEvent(self, event):
+        self._coord_label.hide()
+        super().leaveEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update()
+
+    def _update_coord_label(self, pos):
+        enu = self._widget_to_enu(pos)
+        if enu is None:
+            self._coord_label.hide()
+            return
+        east, north = enu
+        latlon = self._enu_to_latlon(east, north)
+        if latlon is None:
+            self._coord_label.hide()
+            return
+        lat, lon = latlon
+        self._coord_label.setText("{:.6f}°, {:.6f}°".format(lat, lon))
+        self._coord_label.adjustSize()
+        lx = int(pos.x()) + 16
+        ly = int(pos.y()) - 10
+        if lx + self._coord_label.width() > self.width():
+            lx = int(pos.x()) - self._coord_label.width() - 8
+        if ly < 28:
+            ly = 28
+        self._coord_label.move(lx, ly)
+        self._coord_label.show()
+        self._coord_label.raise_()
+
+
+# ---------------------------------------------------------------------------
 # Tabbed viewport (Image | Flight Map | Ortho)
 # ---------------------------------------------------------------------------
 
@@ -388,7 +705,7 @@ class PhotogrammetryViewport(QWidget):
         self._stack = QStackedWidget()
         self.image_view   = ImageViewer()
         self.flight_map   = FlightMapView()
-        self.ortho_view   = ImageViewer()
+        self.ortho_view   = OrthoViewer()
         self._stack.addWidget(self.image_view)
         self._stack.addWidget(self.flight_map)
         self._stack.addWidget(self.ortho_view)

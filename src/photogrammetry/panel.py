@@ -338,7 +338,8 @@ class PhotogrammetryPanel(QWidget):
         rejected = info.get("images_rejected", 0)
         reject_str = "  |  {} turn imgs excluded".format(rejected) if rejected else ""
 
-        self._viewport.ortho_view.show_pixmap(
+        ortho = self._viewport.ortho_view
+        ortho.show_pixmap(
             qpix,
             "Orthomosaic  {w}×{h} px  |  {res:.2f} m/px  |  {n}/{tot} images{dirs}{rej}  |  {aw:.0f}m × {ah:.0f}m".format(
                 w=info["width_px"], h=info["height_px"],
@@ -349,6 +350,7 @@ class PhotogrammetryPanel(QWidget):
                 ah=(info["bounds"][3] - info["bounds"][2]),
             )
         )
+        ortho.set_geo(info["origin"], info["bounds"], info["resolution"])
         self._viewport.switch_to("Ortho")
         self.status_message.emit(
             "Orthomosaic complete — {} × {} px  |  {}/{} images used{}".format(
