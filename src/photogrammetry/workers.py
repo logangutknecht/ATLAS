@@ -11,20 +11,26 @@ THUMB_SIZE = (120, 90)
 
 
 class ImageLoaderThread(QThread):
-    """Scans a directory for images, loads thumbnails, and emits them one by one."""
+    """Loads thumbnails from a directory or an explicit list of image paths."""
 
     thumbnail_ready = pyqtSignal(str, QPixmap)   # (path, thumbnail pixmap)
     finished        = pyqtSignal(list)            # list of all image paths
     progress        = pyqtSignal(str)
     error           = pyqtSignal(str)
 
-    def __init__(self, directory):
+    def __init__(self, source):
+        """*source* is either a directory path (str) or a list of file paths."""
         super().__init__()
-        self.directory = directory
+        if isinstance(source, list):
+            self._paths = sorted(source, key=lambda p: os.path.basename(p))
+            self._directory = None
+        else:
+            self._paths = None
+            self._directory = source
 
     def run(self):
         try:
-            paths = self._collect_image_paths()
+            paths = self._paths if self._paths is not None else self._scan_directory()
             self.finished.emit(paths)
             for i, path in enumerate(paths):
                 self.progress.emit("Loading thumbnails… {}/{}".format(i + 1, len(paths)))
@@ -34,9 +40,9 @@ class ImageLoaderThread(QThread):
         except Exception as exc:
             self.error.emit(str(exc))
 
-    def _collect_image_paths(self):
+    def _scan_directory(self):
         paths = []
-        for entry in sorted(os.scandir(self.directory), key=lambda e: e.name):
+        for entry in sorted(os.scandir(self._directory), key=lambda e: e.name):
             if entry.is_file() and os.path.splitext(entry.name)[1].lower() in IMAGE_EXTENSIONS:
                 paths.append(entry.path)
         return paths

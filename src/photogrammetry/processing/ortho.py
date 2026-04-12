@@ -305,4 +305,6 @@ def _normalise(colour_buf, weight_buf):
             colour_buf / weight_buf[:, :, None],
             0,
         ).astype(np.uint8)
+    # Grid row 0 = ymin (south); flip so North is at the top
+    rgb = np.flipud(rgb)
     return PILImage.fromarray(rgb)

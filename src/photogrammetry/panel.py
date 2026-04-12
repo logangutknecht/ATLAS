@@ -67,10 +67,15 @@ class PhotogrammetryPanel(QWidget):
             "QToolBar QLabel { color:#aaa; font-size:11px; background:transparent; }"
         )
 
-        open_btn = QPushButton("Open Image Folder")
-        open_btn.setFixedHeight(26)
-        open_btn.clicked.connect(self._open_folder_dialog)
-        tb.addWidget(open_btn)
+        open_folder_btn = QPushButton("Open Image Folder")
+        open_folder_btn.setFixedHeight(26)
+        open_folder_btn.clicked.connect(self._open_folder_dialog)
+        tb.addWidget(open_folder_btn)
+
+        open_files_btn = QPushButton("Open Images")
+        open_files_btn.setFixedHeight(26)
+        open_files_btn.clicked.connect(self._open_files_dialog)
+        tb.addWidget(open_files_btn)
 
         tb.addSeparator()
 
@@ -104,9 +109,9 @@ class PhotogrammetryPanel(QWidget):
 
         tb.addSeparator()
 
-        self._folder_label = QLabel("No folder loaded")
-        self._folder_label.setStyleSheet("color:#888; font-size:11px; background:transparent;")
-        tb.addWidget(self._folder_label)
+        self._source_label = QLabel("No images loaded")
+        self._source_label.setStyleSheet("color:#888; font-size:11px; background:transparent;")
+        tb.addWidget(self._source_label)
 
         return tb
 
@@ -156,10 +161,15 @@ class PhotogrammetryPanel(QWidget):
 
     def setup_menus(self, menubar):
         fm = menubar.addMenu("&File")
-        act = QAction("Open Image Folder\u2026", self)
-        act.setShortcut("Ctrl+O")
-        act.triggered.connect(self._open_folder_dialog)
-        fm.addAction(act)
+        act_folder = QAction("Open Image Folder\u2026", self)
+        act_folder.setShortcut("Ctrl+O")
+        act_folder.triggered.connect(self._open_folder_dialog)
+        fm.addAction(act_folder)
+
+        act_files = QAction("Open Images\u2026", self)
+        act_files.setShortcut("Ctrl+Shift+O")
+        act_files.triggered.connect(self._open_files_dialog)
+        fm.addAction(act_files)
 
         pm = menubar.addMenu("&Processing")
         self._act_ortho = QAction("Build Orthomosaic\u2026", self)
@@ -167,7 +177,7 @@ class PhotogrammetryPanel(QWidget):
         self._act_ortho.triggered.connect(self._run_ortho)
         pm.addAction(self._act_ortho)
 
-    # -- Folder loading -----------------------------------------------------
+    # -- Image loading ------------------------------------------------------
 
     def _open_folder_dialog(self):
         folder = QFileDialog.getExistingDirectory(
@@ -175,9 +185,25 @@ class PhotogrammetryPanel(QWidget):
         )
         if folder:
             self._image_dir = folder
-            self._load_folder(folder)
+            self._source_label.setText(os.path.basename(folder))
+            self._load_images(folder)
 
-    def _load_folder(self, folder):
+    def _open_files_dialog(self):
+        from src.photogrammetry.workers import IMAGE_EXTENSIONS
+        exts = " ".join("*" + ext for ext in sorted(IMAGE_EXTENSIONS))
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select Images", self._image_dir,
+            "Images ({});;All files (*)".format(exts),
+        )
+        if paths:
+            self._image_dir = os.path.dirname(paths[0])
+            self._source_label.setText("{} image{}".format(
+                len(paths), "s" if len(paths) != 1 else "",
+            ))
+            self._load_images(paths)
+
+    def _load_images(self, source):
+        """Start loading from *source* (a directory path or list of file paths)."""
         if self._loader and self._loader.isRunning():
             self._loader.terminate()
             self._loader.wait()
@@ -189,9 +215,17 @@ class PhotogrammetryPanel(QWidget):
         self._build_ortho_btn.setEnabled(False)
         self._progress.setValue(0)
         self._progress.show()
-        self.status_message.emit("Loading images from {}…".format(os.path.basename(folder)))
 
-        self._loader = ImageLoaderThread(folder)
+        if isinstance(source, list):
+            self.status_message.emit("Loading {} image{}…".format(
+                len(source), "s" if len(source) != 1 else "",
+            ))
+        else:
+            self.status_message.emit("Loading images from {}…".format(
+                os.path.basename(source),
+            ))
+
+        self._loader = ImageLoaderThread(source)
         self._loader.thumbnail_ready.connect(self._on_thumbnail_ready)
         self._loader.finished.connect(self._on_images_found)
         self._loader.progress.connect(self._on_image_load_progress)
@@ -202,7 +236,6 @@ class PhotogrammetryPanel(QWidget):
         self._image_paths = paths
         n = len(paths)
         self._count_label.setText("{:,} image{}".format(n, "s" if n != 1 else ""))
-        self._folder_label.setText(os.path.basename(self._image_dir))
         self.status_message.emit("Found {:,} images — reading metadata…".format(n))
 
         # Start metadata loading right after image discovery
@@ -359,9 +392,3 @@ class PhotogrammetryPanel(QWidget):
         self.status_message.emit("Error")
         QMessageBox.critical(self, "Error", msg)
 
-    # -- Auto-load ----------------------------------------------------------
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        if not self._image_paths and os.path.isdir(self._image_dir):
-            self._load_folder(self._image_dir)
