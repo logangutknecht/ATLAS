@@ -14,11 +14,10 @@ from PyQt6.QtWidgets import (
     QScrollArea, QGridLayout, QPushButton, QSizePolicy,
     QGraphicsView, QGraphicsScene, QGraphicsEllipseItem,
     QGraphicsLineItem, QGraphicsPolygonItem, QStackedWidget,
-    QTabBar,
+    QTabBar, QApplication,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QRectF
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QRectF, QPointF, QTimer
 from PyQt6.QtGui import QPixmap, QIcon, QFont, QColor, QPen, QBrush, QPolygonF
-from PyQt6.QtCore import QPointF
 
 
 _THUMB_BTN_STYLE = (
@@ -189,17 +188,102 @@ class FlightMapView(QGraphicsView):
         self.setRenderHint(self.renderHints() | self.renderHints().Antialiasing)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setMouseTracking(True)
 
         self._metadata   = []
         self._poses      = []
         self._dot_items  = {}   # path -> QGraphicsEllipseItem
+        self._meta_by_path = {}  # path -> metadata dict
         self._active_path = None
+        self._hover_path  = None
+        self._thumb_cache = {}   # path -> QPixmap
+
+        self._preview = self._build_preview_widget()
+
+    def _build_preview_widget(self):
+        w = QWidget(self)
+        w.setStyleSheet(
+            "QWidget { background: #1e1e2e; border: 1px solid #444; border-radius: 4px; }"
+        )
+        w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        w.hide()
+
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(4)
+
+        self._preview_thumb = QLabel()
+        self._preview_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._preview_thumb.setFixedSize(180, 135)
+        self._preview_thumb.setStyleSheet("border: none; background: transparent;")
+        lay.addWidget(self._preview_thumb)
+
+        self._preview_caption = QLabel()
+        self._preview_caption.setStyleSheet(
+            "color: #ccc; font-size: 10px; border: none; background: transparent;"
+        )
+        self._preview_caption.setWordWrap(True)
+        lay.addWidget(self._preview_caption)
+
+        w.setFixedWidth(192)
+        return w
+
+    def _show_preview(self, path, viewport_pos):
+        meta = self._meta_by_path.get(path)
+        if meta is None:
+            self._preview.hide()
+            return
+
+        if path not in self._thumb_cache:
+            pix = QPixmap(path)
+            if pix.isNull():
+                self._preview.hide()
+                return
+            self._thumb_cache[path] = pix.scaled(
+                180, 135,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        self._preview_thumb.setPixmap(self._thumb_cache[path])
+
+        gps = meta["gps"]
+        gimbal = meta["gimbal"]
+        self._preview_caption.setText(
+            "{name}\n"
+            "{lat:.6f}°, {lon:.6f}°\n"
+            "Alt {alt:.0f}m  |  Hdg {hdg:.1f}°".format(
+                name=os.path.basename(path),
+                lat=gps["latitude"], lon=gps["longitude"],
+                alt=gps["altitude_relative"],
+                hdg=gimbal["yaw"],
+            )
+        )
+        self._preview.adjustSize()
+
+        x = viewport_pos.x() + 16
+        y = viewport_pos.y() + 16
+        vw, vh = self.viewport().width(), self.viewport().height()
+        pw, ph = self._preview.width(), self._preview.height()
+        if x + pw > vw:
+            x = viewport_pos.x() - pw - 8
+        if y + ph > vh:
+            y = viewport_pos.y() - ph - 8
+        self._preview.move(x, y)
+        self._preview.show()
+        self._preview.raise_()
+
+    def _hide_preview(self):
+        self._preview.hide()
+        self._hover_path = None
 
     def load(self, all_metadata: list, poses: list):
         self._scene.clear()
         self._dot_items.clear()
+        self._thumb_cache.clear()
+        self._meta_by_path = {m["path"]: m for m in all_metadata}
         self._metadata = all_metadata
         self._poses    = poses
+        self._hide_preview()
 
         if not poses:
             return
@@ -220,6 +304,22 @@ class FlightMapView(QGraphicsView):
     def wheelEvent(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
         self.scale(factor, factor)
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        item = self.itemAt(event.pos())
+        path = item.data(0) if item else None
+        if path and path != self._hover_path:
+            self._hover_path = path
+            self._show_preview(path, event.pos())
+        elif path and path == self._hover_path:
+            self._show_preview(path, event.pos())
+        elif not path and self._hover_path:
+            self._hide_preview()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self._hide_preview()
 
     # -- drawing helpers ----------------------------------------------------
 

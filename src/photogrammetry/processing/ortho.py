@@ -74,6 +74,13 @@ def build_orthomosaic(
     origin = compute_origin(valid)
     poses  = [build_camera_pose(m, origin) for m in valid]
 
+    # Rotate camera positions 180° while preserving rotation matrices so that
+    # adjacent flight rows land on the correct side of each other.
+    for p in poses:
+        p["position"] = p["position"].copy()
+        p["position"][0] = -p["position"][0]
+        p["position"][1] = -p["position"][1]
+
     # Compute spatial extent
     footprints = [
         compute_image_footprint(pose, m["calibration"], m["image_width"], m["image_height"])
